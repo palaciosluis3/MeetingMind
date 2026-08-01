@@ -44,7 +44,7 @@ engranaje, arriba a la derecha.
 | Campo | Para qué sirve |
 |---|---|
 | **Tu nombre completo** | La app lo usa para separar tus tareas de las del equipo, y se lo pasa a la IA para que te reconozca en la conversación. |
-| **Otros nombres con los que te llaman** | Apodos o el apellido a secas, separados por comas. Si en tus reuniones te dicen "Lucho" y tú te llamas Luis Palacios, ponlo aquí: mejora bastante el reconocimiento. |
+| **Otros nombres con los que te llaman** | Apodos o el apellido a secas, separados por comas. Si en tus reuniones te dicen "Juancho" y tú te llamas Juan Pérez, ponlo aquí: mejora bastante el reconocimiento. |
 | **API Key de Google Gemini** | Obligatoria. Genera el acta y las tareas, y transcribe el audio sin costo. |
 | **API Key de OpenAI** | Opcional. Solo habilita dos modelos de transcripción de pago. Sin ella, todo funciona con Gemini. |
 
