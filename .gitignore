@@ -1,0 +1,14 @@
+# Configuración personal: API keys y nombre del usuario.
+# NUNCA debe subirse al repositorio. Cada persona crea la suya en el primer
+# arranque, desde el diálogo de Configuración de la app.
+config.json
+
+# Datos de reuniones. Contienen transcripciones y tareas reales.
+database.json
+database.json.bak
+
+# Archivos generados en cada equipo.
+VISTA_MOVIL.html
+server_errors.log
+__pycache__/
+*.pyc

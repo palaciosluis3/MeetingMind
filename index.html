@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="es" class="dark">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MeetingMind</title>
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@300;400;500;600;700&display=swap"
+    rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'sans-serif'],
+            outfit: ['Outfit', 'sans-serif'],
+          },
+          colors: {
+            executive: {
+              black: '#0a0a0c', // Deepest Charcoal
+              slate: '#121216', // Rich Surface
+              indigo: '#818cf8', // Premium Periwinkle/Indigo
+              emerald: '#10b981', // Crisp Emerald
+              silver: '#e2e8f0', // Sophisticated Silver
+              accent: '#4f46e5', // Direct Indigo Accent
+            },
+          },
+        },
+      },
+    }
+  </script>
+  <link rel="stylesheet" href="/index.css">
+
+  <script type="importmap">
+    {
+        "imports": {
+            "react": "https://esm.sh/react@18.2.0",
+            "react-dom": "https://esm.sh/react-dom@18.2.0",
+            "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+            "@google/genai": "https://esm.sh/@google/genai@1.38.0",
+            "lucide-react": "https://esm.sh/lucide-react@0.460.0?deps=react@18.2.0"
+        }
+    }
+    </script>
+
+  <!-- Pinning Babel to 7.23.0 to avoid the .targets["esmodules"] bug in newer versions -->
+  <script crossorigin src="https://unpkg.com/@babel/standalone@7.23.0/babel.min.js"></script>
+</head>
+
+<body class="bg-slate-950 text-slate-200">
+  <div id="root">
+    <div class="min-h-screen flex items-center justify-center">
+      <div class="text-center">
+        <div class="inline-block animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-cyan-500 mb-4"></div>
+        <div class="text-cyan-500 font-mono animate-pulse">Cargando MeetingMind...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings (name + API keys) live in config.json, which server.pyw serves
+       here as a plain script. Loading it synchronously means the app already has
+       its configuration by the time it mounts. This file therefore contains no
+       secrets and is safe to distribute; config.json never is. -->
+  <script src="/config.js"></script>
+
+  <script>
+    // Global Error Handler
+    window.addEventListener('error', function (e) {
+      console.error('SYSTEM ERROR:', e);
+      const root = document.getElementById('root');
+      if (root) {
+        root.innerHTML = `
+                    <div style="background: #000; color: #ff3333; padding: 2rem; border: 2px solid #ff3333; font-family: monospace; max-width: 90%; margin: 2rem auto; border-radius: 8px;">
+                        <h1 style="margin-top: 0;">Error de carga</h1>
+                        <p><strong>Mensaje:</strong> ${e.message}</p>
+                        <p><strong>Archivo:</strong> ${e.filename}</p>
+                        <p><strong>Línea:</strong> ${e.lineno}</p>
+                        <hr style="border: 0; border-top: 1px solid #440000; margin: 1rem 0;">
+                        <p style="color: #888; font-size: 0.8rem;">Sugerencia: Intente Ctrl + F5 o verifique la conexión al servidor.</p>
+                    </div>
+                `;
+      }
+    });
+  </script>
+
+  <!-- We re-enable data-type="module" but with Babel 7.23.0 which doesn't have the bug -->
+  <script type="text/babel" data-type="module" data-presets="typescript,react" src="./MeetingMindPortable.tsx"></script>
+</body>
+
+</html>
