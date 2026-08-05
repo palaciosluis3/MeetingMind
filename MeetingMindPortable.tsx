@@ -4,7 +4,7 @@ import { createPortal } from 'react-dom';
 import {
     FileText, ListTodo, MessageSquare, ShieldCheck, Cpu, Terminal, Trash2, AlertCircle,
     Upload, Loader2, User, AlertTriangle, Gavel, Users, ChevronRight, CheckCircle2, Circle, Star, Download,
-    Copy, Check, File, Plus, Search, Power, Settings
+    Copy, Check, File, Plus, Search, Power, Settings, Presentation
 } from 'lucide-react';
 import * as GoogleAIModule from "@google/genai";
 
@@ -171,6 +171,50 @@ const PROVIDERS: Record<string, {
 
 const isOpenAI = (provider: string) =>
     provider === PROVIDER_OPENAI_FAST || provider === PROVIDER_OPENAI_DIARIZE;
+
+// Session type, asked right after the provider and before anything is uploaded.
+// A work meeting produces minutes + assigned tasks; a conference produces the
+// same minutes with key ideas but NO tasks — nobody in the audience is being
+// assigned anything, and forcing the model to extract actions from a talk
+// invents them. Both modes diarize identically.
+const MODE_MEETING = 'meeting';
+const MODE_CONFERENCE = 'conference';
+const STORAGE_KEY_MODE = 'meetingmind_session_mode';
+
+const isConference = (mode: string) => mode === MODE_CONFERENCE;
+
+// Wording that changes between the two modes. Everything else — the transcript,
+// the four `minutes` fields, persistence — is shared, so only the labels differ.
+const MODE_COPY: Record<string, {
+    label: string;
+    subtitle: string;
+    minuteTitle: string;
+    decisions: { title: string; hint: string; empty: string };
+    points: { title: string; hint: string; empty: string };
+    participants: { title: string; hint: string };
+    lastCard: string;
+}> = {
+    [MODE_MEETING]: {
+        label: 'Reunión de trabajo',
+        subtitle: 'Junta, 1:1, comité, daily',
+        minuteTitle: 'Minuta',
+        decisions: { title: 'Decisiones', hint: 'Acuerdos de la reunión', empty: 'No se registraron decisiones en esta reunión.' },
+        points: { title: 'Puntos clave', hint: 'Temas discutidos', empty: 'No se registraron puntos de discusión.' },
+        participants: { title: 'Participantes', hint: 'Asistentes detectados' },
+        lastCard: 'Última reunión',
+    },
+    [MODE_CONFERENCE]: {
+        label: 'Conferencia o evento',
+        subtitle: 'Charla, ponencia, panel, clase o webinar',
+        minuteTitle: 'Relatoría',
+        decisions: { title: 'Conclusiones y anuncios', hint: 'Cierres y compromisos declarados', empty: 'No se anunciaron conclusiones ni compromisos.' },
+        points: { title: 'Ideas clave', hint: 'Argumentos centrales expuestos', empty: 'No se registraron ideas clave.' },
+        participants: { title: 'Ponentes y participantes', hint: 'Voces identificadas' },
+        lastCard: 'Última conferencia',
+    },
+};
+
+const modeCopy = (mode?: string) => MODE_COPY[mode || MODE_MEETING] || MODE_COPY[MODE_MEETING];
 
 // Gemini model used for analysis (minutes + tasks) whatever transcribed the audio.
 const MODEL_DISPLAY_NAME = PROVIDERS[PROVIDER_GEMINI].label;
@@ -452,11 +496,19 @@ const migrateTask = (task: any): Task => {
     } as Task;
 };
 
+// 'meeting' produces minutes + tasks; 'conference' produces minutes with key
+// ideas and an empty task list. The four `minutes` fields are the same in both —
+// only their meaning and their on-screen titles change (see MODE_COPY).
+export type SessionMode = 'meeting' | 'conference';
+
 export interface MeetingData {
     language: string;
     transcript_raw: string;
     minutes: MinuteData;
     tasks: Task[];
+    // Records written before conference mode existed have no `mode`;
+    // migrateMeetingData reads those as 'meeting'.
+    mode: SessionMode;
 }
 
 // ==========================================
@@ -611,6 +663,47 @@ const buildAnalysisSchema = (owner: OwnerIdentity | null) => ({
     required: ["language", "minutes", "tasks"],
 });
 
+// Conference variant: same `language` + `minutes` shape, so every consumer
+// downstream (persistence, MinutesView, the Markdown export, the RENAME_SPEAKER
+// handler) works untouched. What changes is that `tasks` is GONE from the
+// schema — a talk assigns nothing to anybody, and leaving the field in is what
+// made the model invent actions — and that each description is rewritten for a
+// talk instead of a meeting. Takes no owner: with no `is_owner` to decide, the
+// person's name would be noise here (unlike buildAnalysisSchema, where naming
+// them is what keeps attribution honest).
+const buildConferenceSchema = () => ({
+    type: ST.OBJECT,
+    properties: {
+        language: { type: ST.STRING, description: "The primary language of the conference." },
+        minutes: {
+            type: ST.OBJECT,
+            properties: {
+                decisions: {
+                    type: ST.ARRAY,
+                    description: "Conclusiones, anuncios o compromisos declarados por los ponentes. Vacío si no los hubo.",
+                    items: { type: ST.STRING },
+                },
+                discussion_points: {
+                    type: ST.ARRAY,
+                    description: "IDEAS CLAVE: los argumentos centrales y aportes sustantivos expuestos, con su contenido concreto.",
+                    items: { type: ST.STRING },
+                },
+                participants: {
+                    type: ST.ARRAY,
+                    description: "Ponentes, moderador y demás voces identificadas en la sesión.",
+                    items: { type: ST.STRING },
+                },
+                full_summary_text: {
+                    type: ST.STRING,
+                    description: "Relatoría DETALLADA y EXTENSA de la sesión: hilo argumental, ejemplos, datos citados y preguntas del público.",
+                },
+            },
+            required: ["decisions", "discussion_points", "participants", "full_summary_text"],
+        },
+    },
+    required: ["language", "minutes"],
+});
+
 // One JSON object per speaker turn. A free-form string here was the root cause
 // of the diarization bug: the model separated turns with a space instead of a
 // newline, so the parser saw one giant turn per line. With an array the model
@@ -696,21 +789,57 @@ ${owner ? `        1. ${owner.name.toUpperCase()}: No asumas que ${owner.firstNa
         ⚠️ FORMATO OBLIGATORIO: Responde ÚNICAMENTE con JSON válido según el esquema, sin preámbulos. NO devuelvas la transcripción, solo el análisis.
 `;
 
+// Conference variant of the analysis prompt. Deliberately WITHOUT the task
+// manager section: in a talk there is nobody to assign work to, and asking for
+// tasks anyway is what produced invented ones.
+//
+// It also takes no owner, which is the one documented exception to the rule in
+// AGENTS.md about interpolating the real name. That rule exists to keep
+// `is_owner` attribution from being guessed — and this schema has no `is_owner`.
+// Here the owner is one more member of the audience, so naming them would only
+// bias the model into treating them as a speaker.
+const conferenceAnalysisSystem = () => `
+        Eres un relator profesional de conferencias y eventos.
+        Transformas la TRANSCRIPCIÓN de una charla, ponencia, panel o clase en un registro de alto valor para quien no pudo asistir.
+
+        REGLAS DE IDENTIFICACIÓN:
+        1. PONENTES: Identifícalos por el nombre que aparece en la transcripción. RESPETA los nombres ya presentes.
+        2. Distingue, cuando el texto lo permita, quién expone, quién modera y quién pregunta desde el público.
+        3. CORRECCIÓN CONTEXTUAL: Corrige errores fonéticos o tipográficos según el contexto técnico de la exposición.
+
+        REGLAS DE ANÁLISIS:
+        1. IDEAS CLAVE ("discussion_points"): Extrae los argumentos centrales y aportes sustantivos REALES. Cada idea debe tener contenido propio ("el modelo cayó 30% en datos fuera de dominio"), no un rótulo del tema ("se habló de precisión").
+        2. CONCLUSIONES Y ANUNCIOS ("decisions"): Cierres, recomendaciones finales, anuncios o compromisos que los ponentes declaren. Si la sesión no tuvo ninguno, devuelve una lista vacía: NO rellenes por rellenar.
+        3. RELATORÍA ("full_summary_text"): Redacta una relatoría detallada y extensa en el idioma original, siguiendo el hilo argumental de la exposición. Conserva ejemplos, datos citados y las preguntas del público con su respuesta. Tono profesional y descriptivo, sin formato de email.
+        4. NO extraigas tareas ni asignes acciones a nadie: esto es una exposición, no un reparto de trabajo.
+
+        ⚠️ FORMATO OBLIGATORIO: Responde ÚNICAMENTE con JSON válido según el esquema, sin preámbulos. NO devuelvas la transcripción, solo el análisis.
+`;
+
 // Transcription prompt with strong diarization + cross-segment speaker continuity.
 // The examples use the owner's own first name for the same reason the analysis
 // prompt does: a concrete, real name anchors the rule better than a placeholder.
-const transcriptionSystem = (knownSpeakers: string[], previousTail: string) => {
+const transcriptionSystem = (knownSpeakers: string[], previousTail: string, mode: string = MODE_MEETING) => {
     const owner = getOwner();
     const self = owner ? owner.firstName : 'Carlos';   // one side of the "no atribuyas por mención" examples
+    const conference = isConference(mode);
     return `
         Estatuto: Eres un Estenógrafo Profesional de "Clean Read" (Lectura Limpia) con oído experto para DIARIZACIÓN (separación de hablantes).
         Generas una transcripción fiel, detallada y optimizada para lectura ejecutiva.
+${conference ? `
+        NATURALEZA DEL AUDIO: es una CONFERENCIA o evento (charla, ponencia, panel, clase o webinar), no una reunión de trabajo.
+        - Un ponente puede sostener el turno durante varios minutos seguidos.
+        - Suele haber un moderador que presenta, cede la palabra y cierra.
+        - Puede haber preguntas del público, a menudo con micrófono lejano o mala calidad de audio.` : ''}
 
         DIARIZACIÓN (SEPARACIÓN DE HABLANTES) — PRIORIDAD MÁXIMA:
         1. Distingue a cada persona por su voz (timbre, tono, cadencia) y asigna cada intervención al hablante correcto.
-        2. NOMBRES: Usa el nombre real cuando la persona se identifica, se le nombra o se le saluda ("Gracias, Ana", "${self}, ¿qué opinas?"). Si no hay nombre, usa etiquetas estables: "Hablante 1", "Hablante 2", etc.
+        2. NOMBRES: Usa el nombre real cuando la persona se identifica, se le nombra o se le saluda ("Gracias, Ana", "${self}, ¿qué opinas?"). Si no hay nombre, usa etiquetas estables: "Hablante 1", "Hablante 2", etc.${conference ? `
+           En una conferencia la mejor evidencia es la presentación que hace el moderador ("nos acompaña la doctora Ana Ruiz") y la auto-presentación del ponente.
+           ⚠️ Aunque reconozcas el rol de alguien, la etiqueta sin nombre SIEMPRE es "Hablante N" — nunca "Ponente", "Moderador" ni "Público".` : ''}
         3. CONSISTENCIA: La MISMA voz debe llevar SIEMPRE la MISMA etiqueta/nombre dentro de este segmento.
-        4. UNA ENTRADA POR INTERVENCIÓN: cada vez que cambia la voz, abre una entrada NUEVA en "segments". NUNCA metas dos hablantes distintos en la misma entrada. Es preferible dividir de más que de menos.
+        4. UNA ENTRADA POR INTERVENCIÓN: cada vez que cambia la voz, abre una entrada NUEVA en "segments". NUNCA metas dos hablantes distintos en la misma entrada.${conference ? `
+           Al revés también es un ERROR: NO partas un monólogo del ponente en entradas artificiales. Mientras siga hablando la misma voz, continúa la misma entrada.` : ' Es preferible dividir de más que de menos.'}
         5. NO ATRIBUYAS POR MENCIÓN: que alguien diga "${self}" o "gracias, Ana" significa que habla DE esa persona, no que sea esa persona. Solo el timbre de voz determina el hablante.
 ${knownSpeakers.length ? `
         CONTINUIDAD CON SEGMENTOS ANTERIORES:
@@ -728,7 +857,8 @@ ${previousTail ? `
         1. ELIMINA DISFLUENCIAS: muletillas (eh, em, este...), tartamudeos y falsos comienzos.
         2. LIMPIA REPETICIONES accidentales ("el el proyecto" -> "el proyecto"), salvo énfasis intencional.
         3. PRESERVA EL DETALLE: no resumas. Mantén el 100% del contenido, tecnicismos, nombres e ideas.
-        4. PROHIBIDO repetir la misma palabra más de tres veces seguidas. Si un tramo es ininteligible, escribe "[inaudible]" y sigue adelante.
+        4. PROHIBIDO repetir la misma palabra más de tres veces seguidas. Si un tramo es ininteligible, escribe "[inaudible]" y sigue adelante.${conference ? `
+           Aplica esto sobre todo a las preguntas del público: si no se entienden, escribe "[inaudible]" en vez de suponer qué preguntaron.` : ''}
         5. "time" es RELATIVO a este segmento y empieza en 00:00.
 
         REGLA DE ORO CONTRA ALUCINACIONES:
@@ -750,11 +880,12 @@ const transcribeAudioSegment = async (
     mimeType: string,
     knownSpeakers: string[],
     previousTail: string,
-    offsetSec: number
+    offsetSec: number,
+    mode: string = MODE_MEETING
 ): Promise<TurnSegment[]> => {
     const res = await generateStructured(
         ai,
-        transcriptionSystem(knownSpeakers, previousTail),
+        transcriptionSystem(knownSpeakers, previousTail, mode),
         "Realiza la transcripción completa y verbatim de este segmento de audio, separando a los hablantes en entradas distintas.",
         buildAudioPart(audioSource, mimeType),
         transcriptionSchema,
@@ -795,17 +926,32 @@ const sanitizeSegmentTurns = (turns: TurnSegment[], durationSec: number): TurnSe
     return cleaned;
 };
 
-// Turn an assembled transcript into { language, minutes, tasks }.
-const analyzeTranscript = async (ai: any, fullTranscript: string): Promise<any> => {
+// Turn an assembled transcript into { language, minutes, tasks, mode }.
+//
+// This is the ONE place where the two modes diverge in analysis. Whatever the
+// model returns is normalized here so both branches hand back the same shape:
+// `tasks` is always an array (empty for a conference, whose schema has no tasks
+// at all) and `mode` travels attached to the record all the way to database.json.
+const analyzeTranscript = async (ai: any, fullTranscript: string, mode: string = MODE_MEETING): Promise<any> => {
+    const conference = isConference(mode);
     const owner = getOwner();
-    return await generateStructured(
+
+    const analysis = await generateStructured(
         ai,
-        analysisSystem(owner),
-        "A continuación la transcripción completa de la reunión. Analízala estratégicamente (minuta, decisiones y tareas).",
+        conference ? conferenceAnalysisSystem() : analysisSystem(owner),
+        conference
+            ? "A continuación la transcripción completa de la conferencia. Analízala y extrae la relatoría y las ideas clave. NO extraigas tareas."
+            : "A continuación la transcripción completa de la reunión. Analízala estratégicamente (minuta, decisiones y tareas).",
         { text: fullTranscript },
-        buildAnalysisSchema(owner),
-        "ANALYSIS"
+        conference ? buildConferenceSchema() : buildAnalysisSchema(owner),
+        conference ? "CONFERENCE_ANALYSIS" : "ANALYSIS"
     );
+
+    return {
+        ...analysis,
+        mode: conference ? MODE_CONFERENCE : MODE_MEETING,
+        tasks: conference ? [] : (Array.isArray(analysis?.tasks) ? analysis.tasks : []),
+    };
 };
 
 // Map generic speaker labels ("Hablante A") onto the real names people use in
@@ -873,12 +1019,12 @@ const resolveSpeakerNames = async (ai: any, turns: TurnSegment[]): Promise<TurnS
 };
 
 // Entry point for the "Cargar Transcripción" (text file) flow.
-const processTextWithGemini = async (rawText: string): Promise<MeetingData> => {
+const processTextWithGemini = async (rawText: string, mode: string = MODE_MEETING): Promise<MeetingData> => {
     const ai = new GenAI({ apiKey: getGeminiKey() });
     // Normalize pasted transcripts too, so they get one turn per line like the rest.
     const turns = parseTranscriptTurns(rawText);
     const normalized = turns.length ? serializeTranscript(turns) : rawText;
-    const analysis = await analyzeTranscript(ai, normalized);
+    const analysis = await analyzeTranscript(ai, normalized, mode);
 
     return {
         ...analysis,
@@ -1229,11 +1375,18 @@ const tailContext = (turns: TurnSegment[]): string =>
 const LIMIT_SECONDS = 180 * 60; // 3 hours
 
 const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessingComplete, onError }) => {
-    // The provider modal sits between picking a file and uploading it, so the
-    // choice is always made *before* any paid API call happens.
+    // Two modals sit between picking a file and uploading it — provider, then
+    // session type — so both choices are always made *before* any paid API call
+    // happens. `pendingProvider` doubles as the step marker: null means the
+    // provider question is still open.
     const [pendingFile, setPendingFile] = React.useState<File | null>(null);
+    const [pendingProvider, setPendingProvider] = React.useState<string | null>(null);
+    const [pendingTextFile, setPendingTextFile] = React.useState<File | null>(null);
     const [provider, setProvider] = React.useState<string>(() => {
         try { return localStorage.getItem(STORAGE_KEY_PROVIDER) || PROVIDER_GEMINI; } catch { return PROVIDER_GEMINI; }
+    });
+    const [mode, setMode] = React.useState<string>(() => {
+        try { return localStorage.getItem(STORAGE_KEY_MODE) || MODE_MEETING; } catch { return MODE_MEETING; }
     });
 
     const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1242,13 +1395,26 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
         if (file) setPendingFile(file);
     };
 
-    const startTranscription = (chosen: string) => {
-        const file = pendingFile;
+    const cancelPending = () => {
         setPendingFile(null);
-        if (!file) return;
+        setPendingProvider(null);
+    };
+
+    // Step 1 → step 2: remember the provider, then ask what kind of session it is.
+    const chooseProvider = (chosen: string) => {
         try { localStorage.setItem(STORAGE_KEY_PROVIDER, chosen); } catch { /* ignore */ }
         setProvider(chosen);
-        handleAudioData(file, file.type, chosen);
+        setPendingProvider(chosen);
+    };
+
+    const startTranscription = (chosenMode: string) => {
+        const file = pendingFile;
+        const chosen = pendingProvider;
+        cancelPending();
+        if (!file || !chosen) return;
+        try { localStorage.setItem(STORAGE_KEY_MODE, chosenMode); } catch { /* ignore */ }
+        setMode(chosenMode);
+        handleAudioData(file, file.type, chosen, chosenMode);
     };
 
     // Split the recording into segments by DURATION — identically for every
@@ -1281,7 +1447,7 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
         }
     };
 
-    const handleAudioData = async (blob: Blob, mimeType: string, chosen: string) => {
+    const handleAudioData = async (blob: Blob, mimeType: string, chosen: string, chosenMode: string = MODE_MEETING) => {
         try {
             const apiKey = getGeminiKey();
             const ai = new GenAI({ apiKey });
@@ -1337,7 +1503,7 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
                     onProcessingStart(`${label} · Transcribiendo (${displayName})`);
 
                     const runSegment = () => transcribeAudioSegment(
-                        ai, source, seg.mimeType, knownSpeakers, tailContext(allTurns), seg.audioStartSec
+                        ai, source, seg.mimeType, knownSpeakers, tailContext(allTurns), seg.audioStartSec, chosenMode
                     );
 
                     // Retry once if the model fell into a repetition loop: a single
@@ -1370,8 +1536,12 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
 
             // 4. Serialize once — one turn per line — then analyze.
             const fullTranscript = serializeTranscript(allTurns);
-            onProcessingStart(`Generando minuta y tareas (${MODEL_DISPLAY_NAME})`);
-            const analysis = await analyzeTranscript(ai, fullTranscript);
+            onProcessingStart(
+                isConference(chosenMode)
+                    ? `Generando relatoría e ideas clave (${MODEL_DISPLAY_NAME})`
+                    : `Generando minuta y tareas (${MODEL_DISPLAY_NAME})`
+            );
+            const analysis = await analyzeTranscript(ai, fullTranscript, chosenMode);
 
             const fullData: MeetingData = {
                 ...analysis,
@@ -1385,16 +1555,29 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
         }
     };
 
-    const handleTextFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    // A pasted transcript gets the same session-type question: the analysis
+    // branches the same way whether the text came from a file or from our own
+    // transcription. There is no provider step here — nothing to transcribe — so
+    // the file is only read once the mode is confirmed.
+    const handleTextFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
         const file = e.target.files?.[0];
+        e.target.value = ''; // allow re-picking the same file after a cancel
+        if (file) setPendingTextFile(file);
+    };
+
+    const startTextAnalysis = (chosenMode: string) => {
+        const file = pendingTextFile;
+        setPendingTextFile(null);
         if (!file) return;
+        try { localStorage.setItem(STORAGE_KEY_MODE, chosenMode); } catch { /* ignore */ }
+        setMode(chosenMode);
 
         const reader = new FileReader();
         reader.onload = async (ev) => {
             try {
                 const content = ev.target?.result as string;
                 onProcessingStart(`Procesando transcripción (${MODEL_DISPLAY_NAME})…`);
-                const data = await processTextWithGemini(content);
+                const data = await processTextWithGemini(content, chosenMode);
                 onProcessingComplete(data);
             } catch (err) {
                 console.error(err);
@@ -1433,12 +1616,31 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
                 </label>
             </div>
 
-            {pendingFile && (
+            {pendingFile && !pendingProvider && (
                 <ModelPickerModal
                     file={pendingFile}
                     initialProvider={provider}
-                    onCancel={() => setPendingFile(null)}
+                    onCancel={cancelPending}
+                    onConfirm={chooseProvider}
+                />
+            )}
+
+            {pendingFile && pendingProvider && (
+                <SessionTypeModal
+                    fileName={pendingFile.name}
+                    initialMode={mode}
+                    onBack={() => setPendingProvider(null)}
+                    onCancel={cancelPending}
                     onConfirm={startTranscription}
+                />
+            )}
+
+            {pendingTextFile && (
+                <SessionTypeModal
+                    fileName={pendingTextFile.name}
+                    initialMode={mode}
+                    onCancel={() => setPendingTextFile(null)}
+                    onConfirm={startTextAnalysis}
                 />
             )}
         </>
@@ -1590,7 +1792,118 @@ const ModelPickerModal: React.FC<{
                         onClick={() => onConfirm(choice)}
                         className="px-5 py-2 text-xs font-bold tracking-widest uppercase bg-executive-emerald text-black rounded-lg hover:brightness-110 transition-all"
                     >
-                        Transcribir
+                        Continuar
+                    </button>
+                </div>
+            </div>
+        </div>,
+        document.body
+    );
+};
+
+// --- SessionTypeModal ---
+// Second step of the upload flow, right after the provider is chosen and still
+// before anything is uploaded. What is on the recording decides what the app
+// should even try to produce: a work meeting hands out tasks, a talk does not.
+//
+// `onBack` is optional: the audio flow passes it so the user can return to the
+// provider picker, while the "Cargar Transcripción" flow omits it — there is no
+// previous step there, since a text file has nothing to transcribe.
+const SessionTypeModal: React.FC<{
+    fileName: string;
+    initialMode: string;
+    onBack?: () => void;
+    onCancel: () => void;
+    onConfirm: (mode: string) => void;
+}> = ({ fileName, initialMode, onBack, onCancel, onConfirm }) => {
+    const [choice, setChoice] = React.useState(() => isConference(initialMode) ? MODE_CONFERENCE : MODE_MEETING);
+
+    const options = [
+        {
+            id: MODE_MEETING,
+            icon: Users,
+            title: MODE_COPY[MODE_MEETING].label,
+            subtitle: MODE_COPY[MODE_MEETING].subtitle,
+            produces: 'Minuta, decisiones y tareas asignadas',
+            note: 'Separa tus tareas de las del resto del equipo.',
+        },
+        {
+            id: MODE_CONFERENCE,
+            icon: Presentation,
+            title: MODE_COPY[MODE_CONFERENCE].label,
+            subtitle: MODE_COPY[MODE_CONFERENCE].subtitle,
+            produces: 'Minuta con ideas clave. No extrae tareas',
+            note: 'Reconoce igual a los ponentes, pero no reparte acciones.',
+        },
+    ];
+
+    // Same portal reasoning as ModelPickerModal above: the sticky header's
+    // backdrop-filter would otherwise clip this dialog to the header strip.
+    return createPortal(
+        <div
+            className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 overflow-y-auto"
+            onClick={onCancel}
+        >
+            <div
+                className="w-full max-w-3xl my-auto bg-executive-slate border border-white/10 rounded-2xl shadow-2xl p-6 animate-in zoom-in-95 duration-200"
+                onClick={(e) => e.stopPropagation()}
+            >
+                <div className="flex items-center gap-3 mb-1">
+                    <Presentation size={18} className="text-executive-emerald" />
+                    <h2 className="text-sm font-bold tracking-widest uppercase text-white">Tipo de sesión</h2>
+                </div>
+                <p className="text-xs text-slate-500 truncate" title={fileName}>{fileName}</p>
+                <p className="text-[11px] text-slate-600 mb-5">¿Qué se escucha en esta grabación?</p>
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                    {options.map(opt => (
+                        <button
+                            key={opt.id}
+                            onClick={() => setChoice(opt.id)}
+                            className={`text-left p-5 rounded-xl border transition-all flex flex-col ${choice === opt.id
+                                ? 'border-executive-emerald bg-executive-emerald/[0.07]'
+                                : 'border-white/10 bg-white/[0.02] hover:border-white/20'}`}
+                        >
+                            <div className="flex items-center gap-2.5 mb-1">
+                                <opt.icon size={16} className={choice === opt.id ? 'text-executive-emerald' : 'text-slate-500'} />
+                                <span className="text-xs font-bold text-white leading-tight">{opt.title}</span>
+                            </div>
+                            <p className="text-[11px] text-slate-500 mb-4">{opt.subtitle}</p>
+
+                            <div className="flex items-start gap-1.5 text-[11px] font-bold text-executive-emerald mb-2">
+                                <CheckCircle2 size={12} className="mt-0.5 shrink-0" />
+                                <span>{opt.produces}</span>
+                            </div>
+                            <p className="text-[11px] text-slate-400 leading-relaxed flex-1">{opt.note}</p>
+                        </button>
+                    ))}
+                </div>
+
+                <p className="text-[10px] text-slate-600 mt-4 leading-relaxed">
+                    En ambos modos se reconoce a los hablantes. La diferencia es el análisis: una conferencia
+                    genera relatoría e ideas clave, sin tareas que asignar.
+                </p>
+
+                <div className="flex items-center justify-end gap-2 mt-4">
+                    {onBack && (
+                        <button
+                            onClick={onBack}
+                            className="mr-auto px-4 py-2 text-xs font-bold tracking-widest uppercase text-slate-400 hover:text-white rounded-lg transition-all"
+                        >
+                            Atrás
+                        </button>
+                    )}
+                    <button
+                        onClick={onCancel}
+                        className="px-4 py-2 text-xs font-bold tracking-widest uppercase text-slate-400 hover:text-white rounded-lg transition-all"
+                    >
+                        Cancelar
+                    </button>
+                    <button
+                        onClick={() => onConfirm(choice)}
+                        className="px-5 py-2 text-xs font-bold tracking-widest uppercase bg-executive-emerald text-black rounded-lg hover:brightness-110 transition-all"
+                    >
+                        Procesar
                     </button>
                 </div>
             </div>
@@ -1600,7 +1913,7 @@ const ModelPickerModal: React.FC<{
 };
 
 // --- TranscriptView ---
-const TranscriptView: React.FC<{ transcriptRaw: string, minutes: MinuteData, tasks: Task[] }> = ({ transcriptRaw, minutes, tasks }) => {
+const TranscriptView: React.FC<{ transcriptRaw: string, minutes: MinuteData, tasks: Task[], mode?: string }> = ({ transcriptRaw, minutes, tasks, mode }) => {
     const [copied, setCopied] = React.useState(false);
     const [searchTerm, setSearchTerm] = React.useState('');
 
@@ -1658,15 +1971,20 @@ const TranscriptView: React.FC<{ transcriptRaw: string, minutes: MinuteData, tas
         URL.revokeObjectURL(url);
     };
 
-    // Full meeting minute (acta + tareas + transcripción) as Markdown.
+    // Full minute (acta + tareas + transcripción) as Markdown.
+    //
+    // `tasks` here is the persistent list, which accumulates across meetings — so
+    // a conference must export none of it. Those tasks belong to earlier work
+    // meetings and have nothing to do with the talk being exported.
     const downloadMinute = () => {
-        const meeting = { language: '', transcript_raw: exportedTranscript, minutes, tasks: [] } as MeetingData;
-        const md = buildMeetingMarkdown(meeting, tasks);
+        const conference = isConference(mode || MODE_MEETING);
+        const meeting = { language: '', transcript_raw: exportedTranscript, minutes, tasks: [], mode: (conference ? MODE_CONFERENCE : MODE_MEETING) } as MeetingData;
+        const md = buildMeetingMarkdown(meeting, conference ? [] : tasks, mode);
         const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `MeetingMind_Minuta_${new Date().toISOString().slice(0, 10)}.md`;
+        a.download = `MeetingMind_${conference ? 'Relatoria' : 'Minuta'}_${new Date().toISOString().slice(0, 10)}.md`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -1707,7 +2025,7 @@ const TranscriptView: React.FC<{ transcriptRaw: string, minutes: MinuteData, tas
                         <div className="flex gap-1.5 p-1 bg-white/5 rounded-xl border border-white/5">
                             <button onClick={copyFullTranscript} className="p-2 text-slate-400 hover:text-white hover:bg-white/5 rounded-lg transition-all" title="Copiar Todo"><Copy size={16} /></button>
                             <button onClick={downloadTranscript} className="p-2 text-slate-400 hover:text-white hover:bg-white/5 rounded-lg transition-all" title="Descargar .TXT"><Download size={16} /></button>
-                            <button onClick={downloadMinute} className="p-2 text-slate-400 hover:text-executive-emerald hover:bg-white/5 rounded-lg transition-all" title="Descargar Minuta (.MD)"><FileText size={16} /></button>
+                            <button onClick={downloadMinute} className="p-2 text-slate-400 hover:text-executive-emerald hover:bg-white/5 rounded-lg transition-all" title={`Descargar ${modeCopy(mode).minuteTitle} (.MD)`}><FileText size={16} /></button>
                         </div>
                     </div>
                 </div>
@@ -1806,8 +2124,12 @@ const TranscriptView: React.FC<{ transcriptRaw: string, minutes: MinuteData, tas
 };
 
 // --- MinutesView ---
-const MinutesView: React.FC<{ minutes: MinuteData }> = ({ minutes }: { minutes: MinuteData }) => {
+// The three blocks are the same in both modes — only their titles change, since
+// a conference fills the same fields with key ideas and conclusions rather than
+// discussion points and decisions.
+const MinutesView: React.FC<{ minutes: MinuteData, mode?: string }> = ({ minutes, mode }) => {
     const [copied, setCopied] = React.useState(false);
+    const copy = modeCopy(mode);
 
     const copySummary = () => {
         navigator.clipboard.writeText(minutes.full_summary_text || '');
@@ -1827,7 +2149,7 @@ const MinutesView: React.FC<{ minutes: MinuteData }> = ({ minutes }: { minutes: 
                                 <FileText className="text-executive-emerald" size={28} />
                             </div>
                             <div>
-                                <h3 className="text-2xl font-bold text-white tracking-tight font-outfit">Minuta</h3>
+                                <h3 className="text-2xl font-bold text-white tracking-tight font-outfit">{copy.minuteTitle}</h3>
                                 <div className="flex items-center gap-3 text-[10px] text-slate-500 font-mono mt-1 tracking-widest leading-none">
                                     <span>{new Date().toLocaleDateString('es-ES', { day: '2-digit', month: '2-digit', year: 'numeric' })}</span>
                                 </div>
@@ -1845,7 +2167,7 @@ const MinutesView: React.FC<{ minutes: MinuteData }> = ({ minutes }: { minutes: 
                     <div className="relative">
                         <div className="absolute -left-10 top-0 bottom-0 w-1 bg-executive-emerald/30 rounded-full"></div>
                         <div className="text-slate-300 font-sans text-[16px] leading-[1.8] whitespace-pre-wrap pl-2 italic selection:bg-executive-emerald/40">
-                            {minutes.full_summary_text || "Procesa una reunión para generar el acta."}
+                            {minutes.full_summary_text || "Procesa una sesión para generar el acta."}
                         </div>
                     </div>
                 </div>
@@ -1859,17 +2181,17 @@ const MinutesView: React.FC<{ minutes: MinuteData }> = ({ minutes }: { minutes: 
                             <Gavel className="text-executive-accent" size={22} />
                         </div>
                         <div>
-                            <h3 className="text-lg font-bold text-white tracking-tight font-outfit">Decisiones</h3>
-                            <p className="text-[10px] text-slate-500 font-mono tracking-widest opacity-70">Acuerdos de la reunión</p>
+                            <h3 className="text-lg font-bold text-white tracking-tight font-outfit">{copy.decisions.title}</h3>
+                            <p className="text-[10px] text-slate-500 font-mono tracking-widest opacity-70">{copy.decisions.hint}</p>
                         </div>
                     </div>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                        {minutes.decisions.length > 0 ? minutes.decisions.map((d: string, i: number) => (
+                        {(minutes.decisions || []).length > 0 ? (minutes.decisions || []).map((d: string, i: number) => (
                             <div key={i} className="flex gap-4 p-5 bg-white/[0.02] rounded-2xl border border-white/[0.05] group hover:border-executive-accent/30 hover:bg-white/[0.04] transition-all duration-300">
                                 <div className="text-executive-accent font-mono text-xs mt-0.5 font-bold opacity-30 group-hover:opacity-100 transition-opacity">{(i + 1).toString().padStart(2, '0')}</div>
                                 <p className="text-slate-300 text-sm leading-relaxed font-sans">{d}</p>
                             </div>
-                        )) : <p className="text-slate-600 italic text-sm py-4">No se registraron decisiones en esta reunión.</p>}
+                        )) : <p className="text-slate-600 italic text-sm py-4">{copy.decisions.empty}</p>}
                     </div>
                 </div>
 
@@ -1880,17 +2202,20 @@ const MinutesView: React.FC<{ minutes: MinuteData }> = ({ minutes }: { minutes: 
                             <MessageSquare className="text-executive-emerald" size={22} />
                         </div>
                         <div>
-                            <h3 className="text-lg font-bold text-white tracking-tight font-outfit">Puntos clave</h3>
-                            <p className="text-[10px] text-slate-500 font-mono tracking-widest opacity-70">Temas discutidos</p>
+                            <h3 className="text-lg font-bold text-white tracking-tight font-outfit">{copy.points.title}</h3>
+                            <p className="text-[10px] text-slate-500 font-mono tracking-widest opacity-70">{copy.points.hint}</p>
                         </div>
                     </div>
                     <ul className="space-y-4">
-                        {minutes.discussion_points.map((p: string, i: number) => (
+                        {(minutes.discussion_points || []).map((p: string, i: number) => (
                             <li key={i} className="flex items-start gap-3 text-slate-400 text-sm group">
                                 <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-executive-emerald/40 group-hover:scale-150 group-hover:bg-executive-emerald transition-all duration-300 flex-shrink-0" />
                                 <span className="group-hover:text-slate-200 transition-colors leading-relaxed">{p}</span>
                             </li>
                         ))}
+                        {!(minutes.discussion_points || []).length && (
+                            <li className="text-slate-600 italic text-sm py-2 list-none">{copy.points.empty}</li>
+                        )}
                     </ul>
                 </div>
 
@@ -1901,12 +2226,12 @@ const MinutesView: React.FC<{ minutes: MinuteData }> = ({ minutes }: { minutes: 
                             <Users className="text-slate-400" size={22} />
                         </div>
                         <div>
-                            <h3 className="text-lg font-bold text-white tracking-tight font-outfit">Participantes</h3>
-                            <p className="text-[10px] text-slate-500 font-mono tracking-widest opacity-70">Asistentes detectados</p>
+                            <h3 className="text-lg font-bold text-white tracking-tight font-outfit">{copy.participants.title}</h3>
+                            <p className="text-[10px] text-slate-500 font-mono tracking-widest opacity-70">{copy.participants.hint}</p>
                         </div>
                     </div>
                     <div className="flex flex-wrap gap-2.5">
-                        {minutes.participants.map((p: string) => (
+                        {(minutes.participants || []).map((p: string) => (
                             <span key={p} className="px-4 py-2 bg-white/5 rounded-xl text-[11px] font-bold text-slate-400 border border-white/5 hover:border-executive-emerald/20 hover:text-executive-emerald transition-all duration-300 cursor-default uppercase tracking-tight">
                                 {p}
                             </span>
@@ -2394,20 +2719,26 @@ const EMPTY_MEETING: MeetingData = {
     language: 'es',
     transcript_raw: '',
     minutes: { decisions: [], discussion_points: [], participants: [], full_summary_text: '' },
-    tasks: []
+    tasks: [],
+    mode: MODE_MEETING
 };
 
-// Build a self-contained Markdown export of the current meeting + task list.
-const buildMeetingMarkdown = (meeting: MeetingData, tasks: Task[]): string => {
+// Build a self-contained Markdown export of the current session + task list.
+// Headings follow the session mode; a conference gets no task section at all
+// (its caller passes an empty list — the accumulated tasks on screen belong to
+// earlier meetings and have nothing to do with a talk).
+const buildMeetingMarkdown = (meeting: MeetingData, tasks: Task[], mode: string = MODE_MEETING): string => {
     const date = new Date().toISOString().slice(0, 10);
+    const conference = isConference(mode);
+    const copy = modeCopy(mode);
     const m: any = meeting?.minutes || {};
-    const lines: string[] = [`# Minuta de Reunión — ${date}`, ''];
+    const lines: string[] = [`# ${conference ? 'Relatoría de Conferencia' : 'Minuta de Reunión'} — ${date}`, ''];
 
     if (meeting?.language) lines.push(`*Idioma: ${meeting.language}*`, '');
-    if (m.participants?.length) lines.push('## Participantes', ...m.participants.map((p: string) => `- ${p}`), '');
-    if (m.full_summary_text) lines.push('## Acta', m.full_summary_text, '');
-    if (m.decisions?.length) lines.push('## Decisiones', ...m.decisions.map((d: string) => `- ${d}`), '');
-    if (m.discussion_points?.length) lines.push('## Puntos de Discusión', ...m.discussion_points.map((d: string) => `- ${d}`), '');
+    if (m.participants?.length) lines.push(`## ${copy.participants.title}`, ...m.participants.map((p: string) => `- ${p}`), '');
+    if (m.full_summary_text) lines.push(`## ${conference ? 'Relatoría' : 'Acta'}`, m.full_summary_text, '');
+    if (m.decisions?.length) lines.push(`## ${copy.decisions.title}`, ...m.decisions.map((d: string) => `- ${d}`), '');
+    if (m.discussion_points?.length) lines.push(`## ${conference ? 'Ideas clave' : 'Puntos de Discusión'}`, ...m.discussion_points.map((d: string) => `- ${d}`), '');
 
     if (tasks?.length) {
         lines.push('## Tareas');
@@ -2441,6 +2772,10 @@ function App() {
         // Ensure sub-objects exist
         if (!data.minutes) data.minutes = EMPTY_MEETING.minutes;
         data.tasks = Array.isArray(data.tasks) ? data.tasks.map(migrateTask) : [];
+
+        // Records saved before conference mode existed carry no `mode`; they are
+        // all meetings, and anything unrecognized falls back to the same.
+        data.mode = data.mode === MODE_CONFERENCE ? MODE_CONFERENCE : MODE_MEETING;
 
         return data as MeetingData;
     };
@@ -2576,7 +2911,7 @@ function App() {
             setPersistentTasks(prev => prev.filter(t => !t.completed));
             setMeetingData(prev => ({
                 ...prev,
-                tasks: prev.tasks.filter(t => !t.completed)
+                tasks: (prev.tasks || []).filter(t => !t.completed)
             }));
         };
 
@@ -2618,7 +2953,9 @@ function App() {
             return [...prev, ...tasksToAdd];
         });
         setIsLoading(false);
-        setActiveTab(Tab.TASKS);
+        // A conference produces no tasks, so landing on the Tasks tab would drop
+        // the user on a screen with nothing new on it. Its result is the minute.
+        setActiveTab(isConference(newData.mode) ? Tab.MINUTES : Tab.TASKS);
     };
 
     const clearDatabase = () => {
@@ -2776,18 +3113,18 @@ function App() {
                                         </div>
 
                                         <div className="bg-executive-slate/50 backdrop-blur-xl p-6 rounded-2xl border border-white/10">
-                                            <h3 className="text-slate-400 font-bold text-xs mb-3">Última reunión</h3>
+                                            <h3 className="text-slate-400 font-bold text-xs mb-3">{modeCopy(meetingData.mode).lastCard}</h3>
                                             <div className="text-sm text-slate-300">
-                                                {meetingData.minutes.participants.length > 0 ? (
+                                                {(meetingData.minutes.participants || []).length > 0 ? (
                                                     <div className="flex flex-wrap gap-2">
-                                                        {meetingData.minutes.participants.map(p => (
+                                                        {(meetingData.minutes.participants || []).map(p => (
                                                             <span key={p} className="px-2 py-1 bg-slate-800 rounded text-[10px] uppercase font-bold tracking-wider">
                                                                 {p}
                                                             </span>
                                                         ))}
                                                     </div>
                                                 ) : (
-                                                    <p className="italic text-slate-500">Aún no has procesado ninguna reunión.</p>
+                                                    <p className="italic text-slate-500">Aún no has procesado ninguna sesión.</p>
                                                 )}
                                             </div>
                                         </div>
@@ -2797,7 +3134,7 @@ function App() {
 
                             {activeTab === Tab.MINUTES && (
                                 <div className="max-w-4xl">
-                                    <MinutesView minutes={meetingData.minutes} />
+                                    <MinutesView minutes={meetingData.minutes} mode={meetingData.mode} />
                                 </div>
                             )}
 
@@ -2807,6 +3144,7 @@ function App() {
                                         transcriptRaw={meetingData.transcript_raw}
                                         minutes={meetingData.minutes}
                                         tasks={persistentTasks}
+                                        mode={meetingData.mode}
                                     />
                                 </div>
                             )}

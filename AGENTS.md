@@ -179,6 +179,8 @@ Per-model quirks that are easy to get wrong:
 
 **Analysis is always Gemini.** OpenAI transcription models cannot produce minutes or tasks,
 so `analyzeTranscript` runs on `MODEL` regardless of which provider transcribed the audio.
+After the provider, a second modal asks whether the recording is a meeting or a conference —
+see *Session Modes* below.
 
 There is **no model routing and no cross-model fallback**. `generateStructured` retries the
 *same* model up to 3 times with linear backoff, and only on transient errors (429/5xx).
@@ -251,14 +253,52 @@ Models occasionally fall into a repetition loop (a real run produced 37 k charac
 speech is ~15) or losing over 20 % of its characters to `collapseLoops`, and the segment is
 retried once. Keep this guard in place when touching the transcription loop.
 
+### Session Modes: Meeting vs Conference
+Every processed recording carries a `mode` on `MeetingData`: `MODE_MEETING` or `MODE_CONFERENCE`.
+The user picks it in `SessionTypeModal`, shown *after* `ModelPickerModal` and still before anything
+is uploaded. The choice persists in `localStorage` under `STORAGE_KEY_MODE`.
+
+A conference (a talk, panel, class or webinar) produces the transcript and the minutes, but **no
+tasks** — nobody in an audience is being assigned work, and asking the model for tasks anyway is
+what made it invent them. So `buildConferenceSchema()` has no `tasks` property at all and
+`conferenceAnalysisSystem()` has no task-manager section.
+
+`analyzeTranscript(ai, transcript, mode)` is the **only** branch point, and it normalizes both
+paths to the same shape: `tasks` is always an array (empty for a conference) and `mode` rides
+along to `database.json`. Records written before this existed have no `mode`; `migrateMeetingData`
+reads those as meetings.
+
+`MinuteData` is **not** duplicated per mode — a conference fills the same four fields and only the
+titles change, via the `MODE_COPY` table (`decisions` → "Conclusiones y anuncios",
+`discussion_points` → "Ideas clave", `participants` → "Ponentes y participantes"). That is what
+keeps persistence, the Markdown export and the `RENAME_SPEAKER` handler mode-agnostic.
+
+Two things that are easy to get wrong:
+- **The fallback speaker label stays `"Hablante N"` in both modes.** The conference transcription
+  prompt describes the ponente/moderador/público roles but is explicitly forbidden from using them
+  as labels, because `resolveSpeakerNames`, `hasGenericSpeakers` and the `"Hablante "` prefixing in
+  `transcribeWithOpenAI` all key off that exact string. Emitting "Ponente" breaks name resolution
+  silently.
+- **A conference must export an empty task list.** `persistentTasks` accumulates across meetings,
+  so passing it to `buildMeetingMarkdown` from a conference would staple unrelated meeting tasks
+  onto the relatoría. `downloadMinute` passes `[]` in that mode.
+
+The Tasks tab stays visible in both modes — it is the global accumulator, not a per-session view —
+but `handleProcessingComplete` lands on `Tab.MINUTES` after a conference, since Tasks would be
+unchanged. Only the Gemini transcription prompt is mode-aware; OpenAI providers take no system
+prompt, so with those the transcription is identical and only the analysis differs.
+
 ### Audio Upload Flow
 ```typescript
 // 1. Pick file -> ModelPickerModal (provider choice, duration + cost shown)
-// 2. prepareSegments: decode + split into 10-min chunks, same for every provider
-// 3. Transcribe per segment -> TurnSegment[], threading knownSpeakers + tailContext
-// 4. resolveSpeakerNames: map "Hablante A" onto real names where the audio proves it
-// 5. serializeTranscript -> analyzeTranscript -> render
+// 2.          -> SessionTypeModal (meeting or conference; "Atrás" returns to step 1)
+// 3. prepareSegments: decode + split into 10-min chunks, same for every provider
+// 4. Transcribe per segment -> TurnSegment[], threading knownSpeakers + tailContext
+// 5. resolveSpeakerNames: map "Hablante A" onto real names where the audio proves it
+// 6. serializeTranscript -> analyzeTranscript(mode) -> render
 ```
+The `.txt`/`.md` "Cargar Transcripción" flow shows `SessionTypeModal` too (without the "Atrás"
+button — there is no provider step) and threads the mode into `processTextWithGemini`.
 
 ### Reloading the Page Stops the Local Server
 A `beforeunload` handler `sendBeacon`s `/api/shutdown`, so **any** reload or navigation shuts the
