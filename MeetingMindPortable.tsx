@@ -116,7 +116,7 @@ const assigneeIsOwner = (assignee: string): boolean => {
 
 // Gemini model used for analysis (minutes + tasks) and, optionally, transcription.
 // Its display name comes from the provider registry below.
-const MODEL = "gemini-3.1-flash-lite";
+const MODEL = "gemini-3.5-flash-lite";
 
 // Label used when a model returns text with no speaker attribution at all.
 // Never call that "Hablante 1": the minutes would repeat the invented name.
@@ -144,8 +144,8 @@ const PROVIDERS: Record<string, {
     note: string;
 }> = {
     [PROVIDER_GEMINI]: {
-        label: 'Gemini 3.1 Flash Lite',
-        model: 'gemini-3.1-flash-lite',
+        label: 'Gemini 3.5 Flash Lite',
+        model: 'gemini-3.5-flash-lite',
         costPerMinute: 0,
         realTimeFactor: 0.075,   // ~30-60 s per 10-min segment, observed in use
         diarizes: true,
