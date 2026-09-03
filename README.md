@@ -79,7 +79,7 @@ transcripción, a la minuta y a las tareas de esa persona.
 
 | Modelo | Costo | Velocidad | Separa hablantes |
 |---|---|---|---|
-| **Gemini 3.1 Flash Lite** | Gratis | ~45 s por cada 10 min de audio | Sí, por contexto |
+| **Gemini 3.5 Flash-Lite** | Gratis | ~45 s por cada 10 min de audio | Sí, por contexto |
 | **OpenAI GPT Transcribe** | ~US$ 0,0045/min | El más rápido | **No** — texto corrido |
 | **OpenAI GPT-4o Transcribe Diarize** | ~US$ 0,006/min | El más lento | Sí, el más preciso |
 

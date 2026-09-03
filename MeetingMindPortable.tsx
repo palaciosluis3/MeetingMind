@@ -144,8 +144,8 @@ const PROVIDERS: Record<string, {
     note: string;
 }> = {
     [PROVIDER_GEMINI]: {
-        label: 'Gemini 3.5 Flash Lite',
-        model: 'gemini-3.5-flash-lite',
+        label: 'Gemini 3.5 Flash-Lite',
+        model: MODEL,
         costPerMinute: 0,
         realTimeFactor: 0.075,   // ~30-60 s per 10-min segment, observed in use
         diarizes: true,
@@ -302,6 +302,21 @@ const uploadAudioToGemini = async (blob: Blob, mimeType: string, apiKey: string,
     }
 };
 
+// A no-audio response is an expected outcome for an individual chunk, not a
+// fatal error for the whole recording. Keep it typed so the chunk loop never
+// has to classify it by matching a translated user-facing message.
+class NoAudioDetectedError extends Error {
+    readonly code = 'NO_AUDIO_DETECTED';
+
+    constructor(message = "La IA no detectó audio utilizable en este segmento.") {
+        super(message);
+        this.name = 'NoAudioDetectedError';
+    }
+}
+
+const isNoAudioDetectedError = (error: any): boolean =>
+    error instanceof NoAudioDetectedError || error?.code === 'NO_AUDIO_DETECTED';
+
 // --- Helper: Structured generation (single model, retry with backoff) ---
 const generateStructured = async (
     ai: any,
@@ -377,9 +392,7 @@ const generateStructured = async (
             text.includes("NO_AUDIO_DATA") ||
             text.includes("NO_AUDIO_DETECTED");
 
-        if (hasCriticalError) {
-            throw new Error("La IA no detectó tu audio real. Verifica que el archivo no esté vacío o en silencio.");
-        }
+        if (hasCriticalError) throw new NoAudioDetectedError();
 
         const extractJSON = (rawText: string): any => {
             let cleanText = rawText.trim();
@@ -506,6 +519,9 @@ export interface MeetingData {
     transcript_raw: string;
     minutes: MinuteData;
     tasks: Task[];
+    // Present when one or more chunks were skipped, or when the final analysis
+    // failed after a usable transcript had already been assembled.
+    processing_warnings?: string[];
     // Records written before conference mode existed have no `mode`;
     // migrateMeetingData reads those as 'meeting'.
     mode: SessionMode;
@@ -932,16 +948,24 @@ const sanitizeSegmentTurns = (turns: TurnSegment[], durationSec: number): TurnSe
 // model returns is normalized here so both branches hand back the same shape:
 // `tasks` is always an array (empty for a conference, whose schema has no tasks
 // at all) and `mode` travels attached to the record all the way to database.json.
-const analyzeTranscript = async (ai: any, fullTranscript: string, mode: string = MODE_MEETING): Promise<any> => {
+const analyzeTranscript = async (
+    ai: any,
+    fullTranscript: string,
+    mode: string = MODE_MEETING,
+    isPartial: boolean = false
+): Promise<any> => {
     const conference = isConference(mode);
     const owner = getOwner();
 
     const analysis = await generateStructured(
         ai,
         conference ? conferenceAnalysisSystem() : analysisSystem(owner),
-        conference
-            ? "A continuación la transcripción completa de la conferencia. Analízala y extrae la relatoría y las ideas clave. NO extraigas tareas."
-            : "A continuación la transcripción completa de la reunión. Analízala estratégicamente (minuta, decisiones y tareas).",
+        (conference
+            ? `A continuación la transcripción ${isPartial ? 'disponible' : 'completa'} de la conferencia. Analízala y extrae la relatoría y las ideas clave. NO extraigas tareas.`
+            : `A continuación la transcripción ${isPartial ? 'disponible' : 'completa'} de la reunión. Analízala estratégicamente (minuta, decisiones y tareas).`) +
+            (isPartial
+                ? "\n\nADVERTENCIA: algunos segmentos del audio no pudieron transcribirse. Trabaja únicamente con el contenido disponible, no completes los vacíos ni inventes decisiones, participantes o tareas."
+                : ""),
         { text: fullTranscript },
         conference ? buildConferenceSchema() : buildAnalysisSchema(owner),
         conference ? "CONFERENCE_ANALYSIS" : "ANALYSIS"
@@ -1448,6 +1472,12 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
     };
 
     const handleAudioData = async (blob: Blob, mimeType: string, chosen: string, chosenMode: string = MODE_MEETING) => {
+        // In-memory checkpoint: successful chunks remain available even if a
+        // later transcription or analysis call fails. It deliberately does not
+        // survive a page close/reload, per the portable app's current scope.
+        let allTurns: TurnSegment[] = [];
+        const processingWarnings: string[] = [];
+
         try {
             const apiKey = getGeminiKey();
             const ai = new GenAI({ apiKey });
@@ -1473,55 +1503,77 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
             //    previous segment forward so diarization survives the cuts.
             const knownSpeakers: string[] = [];
             let openAIReferences: { name: string, clip: Blob }[] = [];
-            let allTurns: TurnSegment[] = [];
+            let previousTail = '';
+            let previousSegmentSucceeded = false;
 
             for (let i = 0; i < segments.length; i++) {
                 const seg = segments[i];
                 const label = segments.length > 1 ? `Segmento ${i + 1}/${segments.length}` : 'Audio';
-                let turns: TurnSegment[];
+                try {
+                    let turns: TurnSegment[];
 
-                if (isOpenAI(chosen)) {
-                    onProcessingStart(`${label} · Subiendo a OpenAI`);
-                    turns = await transcribeWithOpenAI(chosen, seg.blob, seg.audioStartSec, (pct) => {
-                        onProcessingStart(pct < 100 ? `${label} · Subiendo ${pct}%` : `${label} · Transcribiendo (${displayName})`);
-                    }, openAIReferences);
+                    if (isOpenAI(chosen)) {
+                        onProcessingStart(`${label} · Subiendo a OpenAI`);
+                        turns = await transcribeWithOpenAI(chosen, seg.blob, seg.audioStartSec, (pct) => {
+                            onProcessingStart(pct < 100 ? `${label} · Subiendo ${pct}%` : `${label} · Transcribiendo (${displayName})`);
+                        }, openAIReferences);
 
-                    // Diarize model only: capture voice references from the first
-                    // segment that yields any, so later segments reuse the same
-                    // speaker labels. gpt-transcribe has no speakers to carry.
-                    if (PROVIDERS[chosen].diarizes && !openAIReferences.length && turns.length && segments.length > 1) {
-                        try {
-                            openAIReferences = await buildSpeakerReferences(seg.blob, turns, seg.audioStartSec);
-                            console.log('[OPENAI] Referencias de voz:', openAIReferences.map(r => r.name));
-                        } catch (refErr) {
-                            console.warn('[OPENAI] No se pudieron construir referencias de voz:', refErr);
+                        // Diarize model only: capture voice references from the first
+                        // segment that yields any, so later segments reuse the same
+                        // speaker labels. gpt-transcribe has no speakers to carry.
+                        if (PROVIDERS[chosen].diarizes && !openAIReferences.length && turns.length && segments.length > 1) {
+                            try {
+                                openAIReferences = await buildSpeakerReferences(seg.blob, turns, seg.audioStartSec);
+                                console.log('[OPENAI] Referencias de voz:', openAIReferences.map(r => r.name));
+                            } catch (refErr) {
+                                console.warn('[OPENAI] No se pudieron construir referencias de voz:', refErr);
+                            }
                         }
-                    }
-                } else {
-                    onProcessingStart(`${label} · Preparando`);
-                    const source = await uploadSegment(seg.blob, seg.mimeType, label);
-                    onProcessingStart(`${label} · Transcribiendo (${displayName})`);
+                    } else {
+                        onProcessingStart(`${label} · Preparando`);
+                        const source = await uploadSegment(seg.blob, seg.mimeType, label);
+                        onProcessingStart(`${label} · Transcribiendo (${displayName})`);
 
-                    const runSegment = () => transcribeAudioSegment(
-                        ai, source, seg.mimeType, knownSpeakers, tailContext(allTurns), seg.audioStartSec, chosenMode
-                    );
+                        const runSegment = () => transcribeAudioSegment(
+                            ai, source, seg.mimeType, knownSpeakers, previousTail, seg.audioStartSec, chosenMode
+                        );
 
-                    // Retry once if the model fell into a repetition loop: a single
-                    // degenerate segment used to poison both the transcript and the
-                    // minutes generated from it.
-                    turns = await runSegment();
-                    let sane = sanitizeSegmentTurns(turns, seg.durationSec);
-                    if (!sane) {
-                        onProcessingStart(`${label} · Reintentando (respuesta degenerada)`);
+                        // Retry once if the model fell into a repetition loop: a single
+                        // degenerate segment used to poison both the transcript and the
+                        // minutes generated from it.
                         turns = await runSegment();
-                        sane = sanitizeSegmentTurns(turns, seg.durationSec);
+                        let sane = sanitizeSegmentTurns(turns, seg.durationSec);
+                        if (!sane) {
+                            onProcessingStart(`${label} · Reintentando (respuesta degenerada)`);
+                            turns = await runSegment();
+                            sane = sanitizeSegmentTurns(turns, seg.durationSec);
+                        }
+                        turns = sane || turns.map(t => ({ ...t, text: collapseLoops(t.text) })).filter(t => t.text);
                     }
-                    turns = sane || turns.map(t => ({ ...t, text: collapseLoops(t.text) })).filter(t => t.text);
-                }
 
-                if (i > 0) turns = dropOverlapTurns(turns, seg.contentStartSec);
-                allTurns = allTurns.concat(turns);
-                collectSpeakers(turns, knownSpeakers);
+                    // An empty provider response has the same operational meaning as
+                    // the explicit Gemini no-audio sentinel: skip only this chunk.
+                    if (!turns.length) throw new NoAudioDetectedError();
+
+                    // If the immediately preceding chunk failed, keep this chunk's
+                    // leading overlap: those seconds are otherwise absent from the
+                    // partial transcript. Also do not feed an older tail across a gap.
+                    if (i > 0 && previousSegmentSucceeded) turns = dropOverlapTurns(turns, seg.contentStartSec);
+                    allTurns = allTurns.concat(turns);
+                    collectSpeakers(turns, knownSpeakers);
+                    previousTail = tailContext(turns);
+                    previousSegmentSucceeded = true;
+                } catch (segmentError: any) {
+                    const noAudio = isNoAudioDetectedError(segmentError);
+                    const warning = noAudio
+                        ? `${label} omitido: no se detectó audio utilizable.`
+                        : `${label} no pudo transcribirse: ${segmentError?.message || 'error desconocido'}`;
+                    processingWarnings.push(warning);
+                    previousTail = '';
+                    previousSegmentSucceeded = false;
+                    console.warn(`[TRANSCRIPTION] ${warning}`, segmentError);
+                    onProcessingStart(`${warning} Continuando con el siguiente segmento…`);
+                }
 
                 if (i < segments.length - 1) await new Promise(r => setTimeout(r, 1200));
             }
@@ -1541,15 +1593,48 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
                     ? `Generando relatoría e ideas clave (${MODEL_DISPLAY_NAME})`
                     : `Generando minuta y tareas (${MODEL_DISPLAY_NAME})`
             );
-            const analysis = await analyzeTranscript(ai, fullTranscript, chosenMode);
+            let analysis: any;
+            try {
+                analysis = await analyzeTranscript(ai, fullTranscript, chosenMode, processingWarnings.length > 0);
+            } catch (analysisError: any) {
+                // The expensive transcription is still a valid deliverable. Publish
+                // it instead of letting the outer catch discard the checkpoint.
+                const warning = `No se pudo generar ${isConference(chosenMode) ? 'la relatoría' : 'la minuta y las tareas'}: ${analysisError?.message || 'error desconocido'}`;
+                processingWarnings.push(warning);
+                onProcessingComplete({
+                    language: '',
+                    transcript_raw: fullTranscript,
+                    minutes: { decisions: [], discussion_points: [], participants: [], full_summary_text: '' },
+                    tasks: [],
+                    mode: isConference(chosenMode) ? MODE_CONFERENCE : MODE_MEETING,
+                    processing_warnings: processingWarnings,
+                } as MeetingData);
+                onError(`${warning}. La transcripción obtenida sí fue conservada.`);
+                return;
+            }
 
             const fullData: MeetingData = {
                 ...analysis,
-                transcript_raw: fullTranscript
+                transcript_raw: fullTranscript,
+                processing_warnings: processingWarnings,
             };
             onProcessingComplete(fullData);
         } catch (err) {
             console.error(err);
+            if (allTurns.length) {
+                const warning = `El proceso se interrumpió después de transcribir parcialmente el audio: ${(err as Error).message}`;
+                processingWarnings.push(warning);
+                onProcessingComplete({
+                    language: '',
+                    transcript_raw: serializeTranscript(allTurns),
+                    minutes: { decisions: [], discussion_points: [], participants: [], full_summary_text: '' },
+                    tasks: [],
+                    mode: isConference(chosenMode) ? MODE_CONFERENCE : MODE_MEETING,
+                    processing_warnings: processingWarnings,
+                } as MeetingData);
+                onError(`${warning}. La transcripción obtenida sí fue conservada.`);
+                return;
+            }
             onProcessingComplete(null);
             onError("No se pudo procesar el audio: " + (err as Error).message);
         }
@@ -1913,7 +1998,7 @@ const SessionTypeModal: React.FC<{
 };
 
 // --- TranscriptView ---
-const TranscriptView: React.FC<{ transcriptRaw: string, minutes: MinuteData, tasks: Task[], mode?: string }> = ({ transcriptRaw, minutes, tasks, mode }) => {
+const TranscriptView: React.FC<{ transcriptRaw: string, minutes: MinuteData, tasks: Task[], mode?: string, processingWarnings?: string[] }> = ({ transcriptRaw, minutes, tasks, mode, processingWarnings = [] }) => {
     const [copied, setCopied] = React.useState(false);
     const [searchTerm, setSearchTerm] = React.useState('');
 
@@ -1978,7 +2063,7 @@ const TranscriptView: React.FC<{ transcriptRaw: string, minutes: MinuteData, tas
     // meetings and have nothing to do with the talk being exported.
     const downloadMinute = () => {
         const conference = isConference(mode || MODE_MEETING);
-        const meeting = { language: '', transcript_raw: exportedTranscript, minutes, tasks: [], mode: (conference ? MODE_CONFERENCE : MODE_MEETING) } as MeetingData;
+        const meeting = { language: '', transcript_raw: exportedTranscript, minutes, tasks: [], mode: (conference ? MODE_CONFERENCE : MODE_MEETING), processing_warnings: processingWarnings } as MeetingData;
         const md = buildMeetingMarkdown(meeting, conference ? [] : tasks, mode);
         const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
         const url = URL.createObjectURL(blob);
@@ -2720,7 +2805,8 @@ const EMPTY_MEETING: MeetingData = {
     transcript_raw: '',
     minutes: { decisions: [], discussion_points: [], participants: [], full_summary_text: '' },
     tasks: [],
-    mode: MODE_MEETING
+    mode: MODE_MEETING,
+    processing_warnings: [],
 };
 
 // Build a self-contained Markdown export of the current session + task list.
@@ -2735,6 +2821,11 @@ const buildMeetingMarkdown = (meeting: MeetingData, tasks: Task[], mode: string 
     const lines: string[] = [`# ${conference ? 'Relatoría de Conferencia' : 'Minuta de Reunión'} — ${date}`, ''];
 
     if (meeting?.language) lines.push(`*Idioma: ${meeting.language}*`, '');
+    if (meeting?.processing_warnings?.length) {
+        lines.push('> **Advertencia: resultado parcial.**');
+        meeting.processing_warnings.forEach(w => lines.push(`> - ${w}`));
+        lines.push('');
+    }
     if (m.participants?.length) lines.push(`## ${copy.participants.title}`, ...m.participants.map((p: string) => `- ${p}`), '');
     if (m.full_summary_text) lines.push(`## ${conference ? 'Relatoría' : 'Acta'}`, m.full_summary_text, '');
     if (m.decisions?.length) lines.push(`## ${copy.decisions.title}`, ...m.decisions.map((d: string) => `- ${d}`), '');
@@ -2772,6 +2863,9 @@ function App() {
         // Ensure sub-objects exist
         if (!data.minutes) data.minutes = EMPTY_MEETING.minutes;
         data.tasks = Array.isArray(data.tasks) ? data.tasks.map(migrateTask) : [];
+        data.processing_warnings = Array.isArray(data.processing_warnings)
+            ? data.processing_warnings.map((w: any) => String(w)).filter(Boolean)
+            : [];
 
         // Records saved before conference mode existed carry no `mode`; they are
         // all meetings, and anything unrecognized falls back to the same.
@@ -3075,6 +3169,18 @@ function App() {
                         </div>
 
                         <div className="animate-in fade-in slide-in-from-bottom-2 duration-500">
+                            {(meetingData.processing_warnings || []).length > 0 && (
+                                <div className="mb-8 flex items-start gap-3 rounded-2xl border border-amber-400/20 bg-amber-400/[0.07] px-5 py-4 text-amber-100/80">
+                                    <AlertTriangle size={18} className="mt-0.5 shrink-0 text-amber-400" />
+                                    <div>
+                                        <p className="text-sm font-bold text-amber-200">Resultado parcial</p>
+                                        <ul className="mt-1 space-y-1 text-xs leading-relaxed">
+                                            {(meetingData.processing_warnings || []).map((warning, index) => <li key={index}>{warning}</li>)}
+                                        </ul>
+                                    </div>
+                                </div>
+                            )}
+
                             {activeTab === Tab.TASKS && (
                                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
                                     <div className="lg:col-span-2">
@@ -3145,6 +3251,7 @@ function App() {
                                         minutes={meetingData.minutes}
                                         tasks={persistentTasks}
                                         mode={meetingData.mode}
+                                        processingWarnings={meetingData.processing_warnings}
                                     />
                                 </div>
                             )}

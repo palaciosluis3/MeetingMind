@@ -24,7 +24,7 @@ Everything user-specific lives in **`config.json`**, next to the app:
 - Keys set the old way, straight into `index.html` as `window.GEMINI_API_KEY` / `window.OPENAI_API_KEY`, are still honored as a fallback.
 
 ### The owner's real name belongs in the prompts
-`analysisSystem(owner)` and `transcriptionSystem(...)` interpolate `ownerName` and `ownerAliases` into the prompt text, and `buildAnalysisSchema(owner)` puts the name in the `is_owner` field description. This is deliberate and measured in use: with a generic placeholder instead of a real name, `gemini-3.1-flash-lite` starts guessing who is who almost immediately. **Do not "clean up" these prompts by replacing the name with a placeholder.** The aliases matter as much as the name — people get called by a nickname or by their surname in a meeting.
+`analysisSystem(owner)` and `transcriptionSystem(...)` interpolate `ownerName` and `ownerAliases` into the prompt text, and `buildAnalysisSchema(owner)` puts the name in the `is_owner` field description. This is deliberate and measured in use: with a generic placeholder instead of a real name, `gemini-3.5-flash-lite` starts guessing who is who almost immediately. **Do not "clean up" these prompts by replacing the name with a placeholder.** The aliases matter as much as the name — people get called by a nickname or by their surname in a meeting.
 
 `getOwner()` returns `null` when nothing is configured; every prompt has a degraded branch for that case, and `is_owner` then stays false.
 
@@ -152,7 +152,7 @@ shows the estimated time and cost for that specific file. The choice persists in
 
 | Provider | Model | Real-time factor | Cost/min | Speakers |
 |---|---|---|---|---|
-| `PROVIDER_GEMINI` | `gemini-3.1-flash-lite` | ~0.075x | free | yes, by prompt |
+| `PROVIDER_GEMINI` | `gemini-3.5-flash-lite` | ~0.075x | free | yes, by prompt |
 | `PROVIDER_OPENAI_FAST` | `gpt-transcribe` | **0.027x** | $0.0045 | **no** |
 | `PROVIDER_OPENAI_DIARIZE` | `gpt-4o-transcribe-diarize` | **0.324x** | $0.006 | yes, native |
 
@@ -252,6 +252,30 @@ Models occasionally fall into a repetition loop (a real run produced 37 k charac
 `sanitizeSegmentTurns` rejects a segment exceeding `MAX_CHARS_PER_SECOND` (35; normal Spanish
 speech is ~15) or losing over 20 % of its characters to `collapseLoops`, and the segment is
 retried once. Keep this guard in place when touching the transcription loop.
+
+### Partial-Failure Resilience
+One bad segment must never discard the valid segments already transcribed. The segment loop has
+its own `try/catch`: an explicit Gemini no-audio sentinel is represented by
+`NoAudioDetectedError`, an empty provider response is treated the same way, and any other
+segment-level error is recorded in `processing_warnings`. In every case the loop continues with
+the next segment. Only a recording where **every** segment fails remains a fatal transcription
+error.
+
+`allTurns` is the in-memory checkpoint. It intentionally does not survive a reload or app crash,
+but it must survive later AI failures in the same run. After a failed segment, clear
+`previousTail` so an older conversation tail is not presented as adjacent context, and keep the
+next segment's leading overlap because those seconds may recover a small part of the missing
+audio. `knownSpeakers` and OpenAI voice references may continue across the gap.
+
+If at least one segment succeeds, `analyzeTranscript(..., isPartial = true)` still generates the
+minute/relatoría and any tasks supported by the available transcript. Its prompt explicitly
+forbids filling gaps or inventing decisions, participants, or tasks. The warnings travel with
+`MeetingData`, are persisted in `database.json`, appear as a visible **Resultado parcial** banner,
+and are included in the Markdown export.
+
+The final analysis call is isolated too: if minute/task generation fails after transcription,
+publish the assembled transcript with empty analysis fields and a warning instead of discarding
+it. `resolveSpeakerNames` remains best-effort and must likewise never sink a completed transcript.
 
 ### Session Modes: Meeting vs Conference
 Every processed recording carries a `mode` on `MeetingData`: `MODE_MEETING` or `MODE_CONFERENCE`.
