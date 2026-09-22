@@ -236,6 +236,11 @@ resample; asking for 16 kHz up front cuts that to ~0.7 GB, and `encodeWAVRange` 
 chunk so no full-length mono copy is ever allocated. The OfflineAudioContext path remains only
 as a fallback for engines that ignore the requested rate.
 
+Decoding failure is **fail-closed**: if the browser cannot decode and split the
+selected container/codec, `prepareSegments` throws, the outer handler shows the
+user a conversion message, and nothing is uploaded. Never restore the old raw-file
+fallback; it could send a multi-hour recording to a provider as one segment.
+
 ### OpenAI Speaker Continuity Across Chunks
 Applies to `PROVIDER_OPENAI_DIARIZE` only; `gpt-transcribe` has no speakers to carry.
 

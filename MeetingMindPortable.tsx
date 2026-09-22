@@ -230,10 +230,6 @@ const TARGET_SAMPLE_RATE = 16000; // 16 kHz mono is plenty for speech and keeps 
 // run-up to its own first words.
 const CHUNK_OVERLAP_SECONDS = 8;
 
-// Only used for the last-resort case where the browser cannot decode the file
-// at all and the raw upload would be rejected outright.
-const OPENAI_MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
-
 // Containers the transcription endpoint accepts. OpenAI infers the format from
 // the filename, so anything outside this list must be re-encoded to WAV first.
 const OPENAI_SUPPORTED_EXT = /\.(mp3|mp4|mpeg|mpga|m4a|wav|webm)$/i;
@@ -1299,7 +1295,7 @@ const encodeWAVRange = (channels: Float32Array[], from: number, to: number, samp
 
 // Decode any browser-supported audio/video, downmix to mono + resample to 16 kHz,
 // and split into fixed-length WAV segments. Throws if the browser can't decode
-// the container/codec (caller then falls back to uploading the raw file whole).
+// the container/codec; callers must stop before uploading an unsegmented file.
 interface AudioChunk {
     blob: Blob;
     audioStartSec: number;    // where this blob's audio begins in the full recording
@@ -1445,7 +1441,7 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
     // provider. 10-minute chunks keep Gemini under its output token limit and,
     // at ~19 MB each, also stay under OpenAI's 25 MB upload cap, so there is no
     // reason to branch on provider or on file size here.
-    const prepareSegments = async (blob: Blob, mimeType: string, chosen: string): Promise<AudioChunk[] | null> => {
+    const prepareSegments = async (blob: Blob): Promise<AudioChunk[] | null> => {
         onProcessingStart("Decodificando y segmentando el audio…");
         try {
             const { chunks, duration } = await decodeAndChunk(blob, CHUNK_SECONDS);
@@ -1456,18 +1452,14 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
             }
             return chunks;
         } catch (decodeErr) {
-            // Last resort: the browser could not decode the container at all, so
-            // upload it untouched. Gemini's File API takes it; OpenAI will only
-            // accept it under 25 MB.
-            console.warn("No se pudo decodificar el audio en el navegador; se subirá el archivo completo:", decodeErr);
-            if (isOpenAI(chosen) && blob.size > OPENAI_MAX_UPLOAD_BYTES) {
-                throw new Error(
-                    `El navegador no pudo decodificar este archivo para segmentarlo, y sin segmentar pesa ` +
-                    `${(blob.size / 1024 / 1024).toFixed(0)} MB, por encima del límite de 25 MB de OpenAI. ` +
-                    `Conviértelo a MP3 o WAV, o usa Gemini.`
-                );
-            }
-            return [{ blob, audioStartSec: 0, contentStartSec: 0, durationSec: 0, mimeType }];
+            // Never upload the original file as a single fallback. A decoding
+            // failure means we cannot enforce the 10-minute safety boundary.
+            console.error("No se pudo decodificar y segmentar el archivo; se detiene antes de subirlo:", decodeErr);
+            throw new Error(
+                "El navegador no pudo decodificar este archivo para dividirlo en segmentos de 10 minutos. " +
+                "Por seguridad, el proceso se detuvo y el archivo no se envió a Gemini ni a OpenAI. " +
+                "Convierte el archivo a MP3 o WAV e inténtalo nuevamente."
+            );
         }
     };
 
@@ -1484,7 +1476,7 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
             const displayName = (PROVIDERS[chosen] || PROVIDERS[PROVIDER_GEMINI]).label;
 
             // 1. Decide how (and whether) to split.
-            const segments = await prepareSegments(blob, mimeType, chosen);
+            const segments = await prepareSegments(blob);
             if (!segments) { onProcessingComplete(null); return; }
 
             // Upload one segment to Gemini (File API, with small base64 fallback).
