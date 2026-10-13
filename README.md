@@ -73,7 +73,47 @@ una clave que el proveedor ya no te va a volver a mostrar.
 
 Si la IA no logró ponerle nombre a alguien, verás "Hablante 1", "Hablante 2".
 **Haz clic sobre el nombre para corregirlo**: el cambio se aplica a la
-transcripción, a la minuta y a las tareas de esa persona.
+transcripción de esa reunión y a sus etiquetas de participante y tareas vinculadas.
+El contenido de la minuta y las tareas queda **pendiente de revisión**.
+
+En Transcripción también puedes **reasignar una intervención**, **fusionar
+hablantes duplicados** de forma explícita y **deshacer** hasta 20 correcciones
+durante la sesión. Los tiempos y la procedencia se conservan. Reasignar o fusionar
+no cambia automáticamente los responsables de las tareas.
+
+**Corregir hablantes por segmento** permite elegir un segmento o un rango con
+los controles **Desde** y **Hasta**. Puedes reemplazar las intervenciones de cada
+hablante por otro de la reunión, o seleccionar dos voces y pulsar **Preparar
+intercambio A↔B** para revertir una inversión. Revisa la vista previa y pulsa
+**Aplicar corrección**: todos los reemplazos ocurren simultáneamente, incluso
+en intervenciones ocultas por una búsqueda. **Deshacer** revierte el grupo completo.
+Cada intervención muestra su segmento de origen; **Ir al inicio** abre ese punto.
+Las transcripciones antiguas sin procedencia conservan la edición individual y
+la fusión, pero no pueden agruparse en segmentos que no fueron guardados.
+
+Gemini puede reconocer a los mismos participantes y aun así invertir sus voces.
+Si una referencia acústica contradice la evidencia fuerte del solapamiento, la
+app deja esas identidades separadas con un aviso para revisión. También evita
+unir dos voces locales cuando distintos mecanismos apuntan a una sola identidad.
+Esto detecta contradicciones disponibles; no garantiza que todas las atribuciones
+sean correctas. La corrección por segmento permite resolver manualmente las
+inversiones restantes sin volver a transcribir el audio.
+
+**Regenerar análisis con Gemini** envía solo la transcripción corregida y puede
+generar costo. Primero muestra una propuesta: puedes aplicar la minuta y elegir
+qué tareas nuevas añadir. Las tareas acumuladas y sus correcciones se conservan;
+ninguna propuesta de tarea se selecciona automáticamente. Revisa posibles
+reformulaciones de tareas existentes antes de añadirlas.
+
+Durante el procesamiento puedes desplegar la **transcripción provisional** de los
+fragmentos terminados. Esa vista no se guarda automáticamente; el resultado final
+o parcial se guarda al terminar. Aún no hay cancelación activa ni recuperación
+del procesamiento después de cerrar o recargar la ventana.
+
+Los avisos tienen una **X** para ocultarlos. **Mostrar avisos ocultos** permite
+recuperarlos; cerrar un aviso no elimina su registro ni marca el análisis como
+revisado. En la fusión, **Actual** es el hablante que quieres reemplazar y
+**Reemplazar por:** es el hablante que conservarás.
 
 ### Modelos de transcripción
 

@@ -4,7 +4,7 @@ import { createPortal } from 'react-dom';
 import {
     FileText, ListTodo, MessageSquare, ShieldCheck, Cpu, Terminal, Trash2, AlertCircle,
     Upload, Loader2, User, AlertTriangle, Gavel, Users, ChevronRight, CheckCircle2, Circle, Star, Download,
-    Copy, Check, File, Plus, Search, Power, Settings, Presentation
+    Copy, Check, File, Plus, Search, Power, Settings, Presentation, X
 } from 'lucide-react';
 import * as GoogleAIModule from "@google/genai";
 
@@ -133,8 +133,8 @@ const STORAGE_KEY_PROVIDER = 'meetingmind_transcription_provider';
 // is 32 KB/s at 16 kHz mono 16-bit, so ≈0.045x. Applies to every provider.
 const UPLOAD_TIME_FACTOR = 0.045;
 
-// Real-time factors are MEASURED, not guessed — see the table below. They drive
-// the time estimate shown before the user commits to a paid run.
+// Measured OpenAI factors and a conservative Gemini baseline drive the estimate.
+// See AGENTS.md for the single-sample Gemini measurement and excluded stages.
 const PROVIDERS: Record<string, {
     label: string;
     model: string;
@@ -147,9 +147,9 @@ const PROVIDERS: Record<string, {
         label: 'Gemini 3.5 Flash-Lite',
         model: MODEL,
         costPerMinute: 0,
-        realTimeFactor: 0.075,   // ~30-60 s per 10-min segment, observed in use
+        realTimeFactor: 0.03,    // conservative baseline: 9.43 s / 600 s observed once on paid Gemini; see AGENTS.md
         diarizes: true,
-        note: 'Separa hablantes por prompt.',
+        note: 'Separa voces por fragmento; conserva continuidad incierta.',
     },
     [PROVIDER_OPENAI_FAST]: {
         label: 'OpenAI GPT Transcribe',
@@ -313,6 +313,34 @@ class NoAudioDetectedError extends Error {
 const isNoAudioDetectedError = (error: any): boolean =>
     error instanceof NoAudioDetectedError || error?.code === 'NO_AUDIO_DETECTED';
 
+class GeminiResponseError extends Error {
+    constructor(readonly kind: 'format' | 'content' | 'truncated' | 'degenerate', message: string) {
+        super(message);
+        this.name = 'GeminiResponseError';
+    }
+}
+
+// Repair syntax only: enclosing fences/prose and trailing commas OUTSIDE strings.
+// Never replace apostrophes/quotes in speech or close an unfinished JSON response.
+const parseGeminiJSON = (text: string): any => {
+    let clean = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+    const first = clean.indexOf('{'), last = clean.lastIndexOf('}');
+    if (first >= 0 && last > first) clean = clean.slice(first, last + 1);
+    try { return JSON.parse(clean); } catch { /* bounded format repair below */ }
+    let fixed = '', inString = false, escaped = false;
+    for (let i = 0; i < clean.length; i++) {
+        const ch = clean[i];
+        if (!inString && ch === ',' && /^\s*[}\]]/.test(clean.slice(i + 1))) continue;
+        fixed += ch;
+        if (escaped) { escaped = false; continue; }
+        if (inString && ch === '\\') { escaped = true; continue; }
+        if (ch === '"') inString = !inString;
+    }
+    try { return JSON.parse(fixed); } catch {
+        throw new GeminiResponseError('format', 'Formato JSON de Gemini inválido; no se completó ni inventó contenido.');
+    }
+};
+
 // --- Helper: Structured generation (single model, retry with backoff) ---
 const generateStructured = async (
     ai: any,
@@ -323,7 +351,8 @@ const generateStructured = async (
     taskName: string
 ): Promise<any> => {
     const runOnce = async () => {
-        console.log(`[${taskName}] Running on ${MODEL} | part:`, contentPart.fileData ? 'fileData' : (contentPart.inlineData ? 'inlineData' : 'text'));
+        const contentParts = Array.isArray(contentPart) ? contentPart : [contentPart];
+        console.log(`[${taskName}] Running on ${MODEL} | parts: ${contentParts.length}`);
 
         // Standard SDK vs New Architecture (Vertex-style) Support
         let result;
@@ -337,7 +366,7 @@ const generateStructured = async (
                 }
             });
             result = await model.generateContent([
-                contentPart,
+                ...contentParts,
                 { text: promptText }
             ]);
         } else if (ai.models && typeof ai.models.generateContent === 'function') {
@@ -345,7 +374,7 @@ const generateStructured = async (
             // Passing it at the top level silently drops it.
             result = await ai.models.generateContent({
                 model: MODEL,
-                contents: [{ role: "user", parts: [contentPart, { text: promptText }] }],
+                contents: [{ role: "user", parts: [...contentParts, { text: promptText }] }],
                 config: {
                     systemInstruction: systemInstruction,
                     responseMimeType: "application/json",
@@ -353,30 +382,26 @@ const generateStructured = async (
                 }
             });
         } else {
-            console.error("SDK Structure mismatch:", ai);
+            console.error("SDK Structure mismatch; client object omitted.");
             throw new Error("Instancia de API incompatible con getGenerativeModel.");
         }
 
-        // Handle inconsistent response wrapper across SDK versions
-        let text: string;
-        if (result.response) {
-            // Standard SDK: result.response is a getter/promise
-            const response = await result.response;
-            text = response.text();
-        } else if (typeof result.text === 'function') {
-            // New Architecture: result IS the response object
-            text = result.text();
-        } else if (result.candidates && result.candidates[0]?.content?.parts?.[0]?.text) {
-            // Fallback: Direct property access
-            text = result.candidates[0].content.parts[0].text;
-        } else {
-            console.warn("Unknown response structure:", result);
-            text = JSON.stringify(result);
+        // @google/genai 1.38 exposes text as a getter; legacy SDK uses text().
+        // Inspect the actual candidate termination BEFORE parsing even valid JSON.
+        const response = result.response ? await result.response : result;
+        const candidate = response?.candidates?.[0];
+        const finishReason = candidate?.finishReason;
+        if (finishReason === 'MAX_TOKENS') {
+            throw new GeminiResponseError('truncated', 'Respuesta de Gemini truncada (MAX_TOKENS).');
         }
-
-        if (!text) throw new Error("Respuesta vacía de la IA.");
-
-        console.log(`[${taskName}] Raw Output Snapshot:`, text.substring(0, 100));
+        if (response?.promptFeedback?.blockReason || (finishReason && finishReason !== 'STOP' && finishReason !== 'FINISH_REASON_UNSPECIFIED')) {
+            throw new GeminiResponseError('content', 'Gemini no completó una respuesta utilizable (bloqueo o terminación anómala).');
+        }
+        const responseText = response?.text;
+        const text: string = typeof responseText === 'function' ? responseText.call(response)
+            : typeof responseText === 'string' ? responseText
+            : (candidate?.content?.parts || []).filter((p: any) => typeof p.text === 'string' && !p.thought).map((p: any) => p.text).join('');
+        if (!text.trim()) throw new GeminiResponseError('content', 'Respuesta vacía de Gemini.');
 
         // Hallucination sentinel: the model is explicitly instructed to emit one
         // of these markers when the audio is empty/silent. Trust ONLY those
@@ -384,51 +409,13 @@ const generateStructured = async (
         // real meetings routinely mention names like "Luis" and words like
         // "mute" ("estaba en mute"), which previously produced false positives
         // and blocked perfectly valid transcriptions.
-        const hasCriticalError = text.includes("CRITICAL_ERROR") ||
-            text.includes("NO_AUDIO_DATA") ||
-            text.includes("NO_AUDIO_DETECTED");
-
-        if (hasCriticalError) throw new NoAudioDetectedError();
-
-        const extractJSON = (rawText: string): any => {
-            let cleanText = rawText.trim();
-
-            cleanText = cleanText.replace(/```json\n?|\n?```/g, "").trim();
-
-            const firstBrace = cleanText.indexOf('{');
-            const lastBrace = cleanText.lastIndexOf('}');
-
-            if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-                cleanText = cleanText.substring(firstBrace, lastBrace + 1);
-            }
-
-            try {
-                return JSON.parse(cleanText);
-            } catch (firstError) {
-                const jsonMatch = cleanText.match(/\{[\s\S]*\}/);
-                if (jsonMatch) {
-                    try {
-                        return JSON.parse(jsonMatch[0]);
-                    } catch (secondError) {
-                        // Continue to next strategy
-                    }
-                }
-
-                try {
-                    let fixed = cleanText
-                        .replace(/,\s*}/g, '}')
-                        .replace(/,\s*]/g, ']')
-                        .replace(/(['"])?([a-zA-Z0-9_]+)(['"])?:/g, '"$2":')
-                        .replace(/'/g, '"');
-                    return JSON.parse(fixed);
-                } catch (thirdError) {
-                    console.error("All JSON extraction strategies failed. Raw text:", rawText);
-                    throw new Error(`Error de formato en la respuesta de la IA: ${firstError.message}`);
-                }
-            }
-        };
-
-        return extractJSON(text);
+        const parsed = parseGeminiJSON(text);
+        const sentinel = parsed?.segments?.length === 1 ? parsed.segments[0] : null;
+        if (taskName === 'TRANSCRIPTION' && sentinel?.speaker === 'SYSTEM' &&
+            typeof sentinel.text === 'string' && /^(?:CRITICAL_ERROR:\s*)?(?:NO_AUDIO_DATA|NO_AUDIO_DETECTED)$/.test(sentinel.text.trim())) {
+            throw new NoAudioDetectedError();
+        }
+        return parsed;
     };
 
     // Retry the SAME model with exponential backoff on transient errors only
@@ -442,8 +429,8 @@ const generateStructured = async (
         } catch (error: any) {
             lastError = error;
             const msg = error?.message || '';
-            const transient = error?.status === 429 || error?.status >= 500 ||
-                /\b(429|500|502|503|overloaded|quota|unavailable)\b/i.test(msg);
+            const transient = !(error instanceof GeminiResponseError) && (error?.status === 429 || error?.status >= 500 ||
+                /\b(429|500|502|503|overloaded|quota|unavailable)\b/i.test(msg));
             if (!transient || attempt === MAX_ATTEMPTS) throw error;
             const delay = 2000 * attempt;
             console.warn(`[${taskName}] Transient error (attempt ${attempt}/${MAX_ATTEMPTS}), retrying in ${delay}ms:`, msg);
@@ -473,10 +460,156 @@ export interface TranscriptSegment {
 // Before this existed the raw string was whatever the model felt like emitting,
 // which is how 72 speaker turns ended up crammed onto 9 lines.
 export interface TurnSegment {
-    startSec: number;
+    startSec?: number;          // absent means unknown; never substitute chunk start
+    endSec?: number;            // only when supplied, never inferred from the next turn
     speaker: string;
     text: string;
+    sourceId?: string | number;
+    source?: {
+        provider: string;
+        chunkIndex: number;
+        interventionIndex: number;
+        audioStartSec: number;
+        contentStartSec: number;
+        durationSec: number;
+        timing: 'api' | 'generated' | 'unavailable';
+    };
+    integrityWarnings?: string[];
+    overlapStatus?: 'uncertain' | 'prefix-trimmed';
+    // Request label, meeting identity and human name are separate concepts.
+    localSpeakerId?: string;
+    speakerReferenceName?: string; // request's acoustic match; checked against the samples actually sent
+    speakerId?: string;
+    speakerName?: string;
+    speakerIdentityMethod?: 'request-local' | 'voice-reference' | 'adjacent-overlap' | 'manual';
+    speakerIdentityEvidence?: {
+        referenceName?: string;
+        referenceTiming?: 'api' | 'generated';
+        rejectedReferenceName?: string;
+        conflictingSpeakerIds?: string[];
+        previousChunkIndex?: number;
+        anchors?: { previousInterventionIndex: number, currentInterventionIndex: number }[];
+    };
+    speakerNameEvidence?: {
+        kind: 'self-introduction' | 'direct-address-response' | 'handoff-response' | 'manual';
+        turnIndices?: number[];
+        quote?: string;
+    };
+    speakerCorrections?: {
+        kind: 'reassign' | 'merge' | 'segment-map';
+        previous: Pick<TurnSegment, 'speaker' | 'speakerId' | 'speakerName' | 'speakerIdentityMethod' | 'speakerIdentityEvidence' | 'speakerNameEvidence'>;
+    }[];
+    textEncodingRepair?: { kind: 'escaped-utf8', originalText: string };
 }
+
+interface SpeakerRecord {
+    id: string;
+    label: string;
+    name?: string;
+    lastSeenChunk: number;
+    referenceName?: string;
+}
+
+interface VoiceReference {
+    speakerId: string;
+    name: string;             // opaque API token; never a person's human name
+    clip: Blob;
+    durationSec: number;
+    rms: number;
+    activeFraction: number;
+    lastSentChunk?: number;
+    sourceTiming?: 'api' | 'generated';
+    sourceStartSec?: number;
+    sourceEndSec?: number;
+}
+
+interface SpeakerRegistry {
+    nextId: number;
+    speakers: Map<string, SpeakerRecord>;
+    requestBindings: Map<string, string>;
+    referenceBindings: Map<string, string>;
+    references: Map<string, VoiceReference>;
+}
+
+const createSpeakerRegistry = (): SpeakerRegistry => ({
+    nextId: 1, speakers: new Map(), requestBindings: new Map(), referenceBindings: new Map(), references: new Map(),
+});
+
+const newSpeakerRecord = (registry: SpeakerRegistry, chunkIndex: number): SpeakerRecord => {
+    const number = registry.nextId++;
+    const record = { id: `speaker_${number}`, label: `Hablante ${number}`, lastSeenChunk: chunkIndex };
+    registry.speakers.set(record.id, record);
+    return record;
+};
+
+const requestSpeakerKey = (provider: string, chunkIndex: number, label: string): string =>
+    JSON.stringify([provider, chunkIndex, label]);
+
+const sentSpeakerReference = (t: TurnSegment, registry: SpeakerRegistry, references: VoiceReference[]) =>
+    references.find(r => r.name === (t.source?.provider === PROVIDER_GEMINI
+        ? t.speakerReferenceName : t.speakerReferenceName || t.localSpeakerId || t.speaker) &&
+        registry.referenceBindings.get(r.name) === r.speakerId);
+
+// A one-to-one acoustic proposal can still be a swap. Contradictory adjacent
+// evidence vetoes reuse, including other local voices sharing disputed IDs.
+const geminiSpeakerConflicts = (turns: TurnSegment[], registry: SpeakerRegistry, references: VoiceReference[],
+    links: Map<string, { speakerId: string, evidence: TurnSegment['speakerIdentityEvidence'] }>) => {
+    const proposals = Array.from(new Map(turns.filter(t => t.source?.provider === PROVIDER_GEMINI).map(t => {
+        const local = t.localSpeakerId || t.speaker;
+        return [local, { local, reference: sentSpeakerReference(t, registry, references)?.speakerId, overlap: links.get(local)?.speakerId }] as const;
+    })).values());
+    const ids = new Set<string>();
+    proposals.forEach(p => {
+        if (p.reference && p.overlap && p.reference !== p.overlap) { ids.add(p.reference); ids.add(p.overlap); }
+        const proposedId = p.reference || p.overlap;
+        if (proposedId && proposals.filter(other => (other.reference || other.overlap) === proposedId).length > 1) ids.add(proposedId);
+    });
+    const locals = new Set<string>();
+    let changed = true;
+    while (changed) {
+        changed = false;
+        proposals.forEach(p => {
+            if (locals.has(p.local) || ![p.reference, p.overlap].some(id => id && ids.has(id))) return;
+            locals.add(p.local);
+            if (p.reference) ids.add(p.reference);
+            if (p.overlap) ids.add(p.overlap);
+            changed = true;
+        });
+    }
+    return { locals, ids };
+};
+
+// Only references actually SENT in this request can resolve a returned token.
+// Unrecognized labels get their own request-scoped identity, even if named A.
+const assignSpeakerIdentities = (
+    turns: TurnSegment[], registry: SpeakerRegistry, sentReferences: VoiceReference[] = [],
+    overlapLinks: Map<string, { speakerId: string, evidence: TurnSegment['speakerIdentityEvidence'] }> = new Map()
+): TurnSegment[] => {
+    const conflicts = geminiSpeakerConflicts(turns, registry, sentReferences, overlapLinks);
+    return turns.map(t => {
+        if (!t.source || t.source.timing === 'unavailable' || t.speaker === OPENAI_UNKNOWN_SPEAKER) return t;
+        const local = t.localSpeakerId || t.speaker;
+        const key = requestSpeakerKey(t.source.provider, t.source.chunkIndex, local);
+        const proposedReference = sentSpeakerReference(t, registry, sentReferences);
+        const conflict = t.source.provider === PROVIDER_GEMINI && conflicts.locals.has(local);
+        const recognized = conflict ? undefined : proposedReference;
+        const link = conflict ? undefined : overlapLinks.get(local);
+        let id = registry.requestBindings.get(key);
+        if (!id) {
+            id = recognized?.speakerId || link?.speakerId || newSpeakerRecord(registry, t.source.chunkIndex).id;
+            registry.requestBindings.set(key, id);
+        }
+        const record = registry.speakers.get(id)!;
+        record.lastSeenChunk = t.source.chunkIndex;
+        return {
+            ...t, localSpeakerId: local, speakerId: id, speaker: record.label,
+            speakerIdentityMethod: recognized ? 'voice-reference' : link ? 'adjacent-overlap' : 'request-local',
+            speakerIdentityEvidence: conflict ? { rejectedReferenceName: proposedReference?.name, conflictingSpeakerIds: Array.from(conflicts.ids), ...overlapLinks.get(local)?.evidence }
+                : recognized ? { referenceName: recognized.name, referenceTiming: recognized.sourceTiming } : link?.evidence,
+            integrityWarnings: conflict ? [...(t.integrityWarnings || []), 'Identidad de voz por revisar: las muestras acústicas y el solapamiento son incompatibles; se conservaron identidades separadas sin crear muestras nuevas de estas voces.'] : t.integrityWarnings,
+        };
+    });
+};
 
 export interface MinuteData {
     decisions: string[];
@@ -501,6 +634,8 @@ const migrateTask = (task: any): Task => {
     const { is_luis_palacios, ...rest } = task || {};
     return {
         ...rest,
+        description: typeof rest.description === 'string' ? repairEscapedUtf8(rest.description) : rest.description,
+        assignee: typeof rest.assignee === 'string' ? repairEscapedUtf8(rest.assignee) : rest.assignee,
         is_owner: typeof task?.is_owner === 'boolean' ? task.is_owner : Boolean(is_luis_palacios),
     } as Task;
 };
@@ -510,14 +645,89 @@ const migrateTask = (task: any): Task => {
 // only their meaning and their on-screen titles change (see MODE_COPY).
 export type SessionMode = 'meeting' | 'conference';
 
+type ProcessingStage = 'preparation' | 'upload' | 'transcription' | 'reconciliation' | 'names' | 'analysis';
+interface ProcessingTimings {
+    totalMs: number;
+    stagesMs: Partial<Record<ProcessingStage, number>>;
+    segmentsTotal: number;
+    segmentsSucceeded: number;
+    segmentsFailed: number;
+    uploadIncludesReadiness?: boolean;
+    uploadCombinedWithApi?: boolean;
+}
+interface ProcessingProgress extends ProcessingTimings {
+    startedAt: number; // monotonic browser clock, transient only
+    stageStartedAt?: number;
+    currentStage?: ProcessingStage;
+}
+const PROCESSING_STAGE_LABELS: Record<ProcessingStage, string> = {
+    preparation: 'Preparación', upload: 'Subida', transcription: 'API de transcripción',
+    reconciliation: 'Reconciliación', names: 'Identificación de nombres', analysis: 'Análisis de la sesión',
+};
+const formatElapsed = (ms: number): string => {
+    if (ms > 0 && ms < 1000) return '<1 s';
+    const seconds = Math.max(0, Math.round(ms / 1000));
+    return seconds < 60 ? `${seconds} s` : `${Math.floor(seconds / 60)} min ${seconds % 60} s`;
+};
+const readProcessingTimings = (value: any): ProcessingTimings | undefined => {
+    const duration = (n: any) => typeof n === 'number' && Number.isFinite(n) && n >= 0;
+    const count = (n: any) => Number.isInteger(n) && n >= 0;
+    if (!value || !duration(value.totalMs) || !count(value.segmentsTotal) ||
+        !count(value.segmentsSucceeded) || !count(value.segmentsFailed) ||
+        value.segmentsSucceeded + value.segmentsFailed > value.segmentsTotal) return undefined;
+    const stagesMs: ProcessingTimings['stagesMs'] = {};
+    (Object.keys(PROCESSING_STAGE_LABELS) as ProcessingStage[]).forEach(stage => {
+        if (duration(value.stagesMs?.[stage])) stagesMs[stage] = value.stagesMs[stage];
+    });
+    return { totalMs: value.totalMs, stagesMs, segmentsTotal: value.segmentsTotal,
+        segmentsSucceeded: value.segmentsSucceeded, segmentsFailed: value.segmentsFailed,
+        uploadIncludesReadiness: value.uploadIncludesReadiness === true,
+        uploadCombinedWithApi: value.uploadCombinedWithApi === true };
+};
+
+// Sequential observation only: this never changes requests, retries or chunk policy.
+const createProcessingClock = (onProgress?: (progress: ProcessingProgress) => void) => {
+    const startedAt = performance.now();
+    const timings: ProcessingTimings = { totalMs: 0, stagesMs: {}, segmentsTotal: 0, segmentsSucceeded: 0, segmentsFailed: 0 };
+    let currentStage: ProcessingStage | undefined;
+    let stageStartedAt: number | undefined;
+    const publish = () => onProgress?.({ ...timings, stagesMs: { ...timings.stagesMs }, startedAt, currentStage, stageStartedAt });
+    const pause = () => {
+        if (currentStage && stageStartedAt !== undefined) {
+            timings.stagesMs[currentStage] = (timings.stagesMs[currentStage] ?? 0) + performance.now() - stageStartedAt;
+        }
+        currentStage = undefined;
+        stageStartedAt = undefined;
+    };
+    return {
+        start(stage: ProcessingStage) { pause(); currentStage = stage; stageStartedAt = performance.now(); publish(); },
+        pause() { pause(); publish(); },
+        setSegments(total: number, succeeded: number, failed: number) {
+            Object.assign(timings, { segmentsTotal: total, segmentsSucceeded: succeeded, segmentsFailed: failed }); publish();
+        },
+        markUploadReadiness() { timings.uploadIncludesReadiness = true; publish(); },
+        markCombinedUpload() { timings.uploadCombinedWithApi = true; publish(); },
+        reclassifyCurrentStage(stage: ProcessingStage) { currentStage = stage; },
+        finish(): ProcessingTimings {
+            pause(); timings.totalMs = performance.now() - startedAt;
+            return { ...timings, stagesMs: { ...timings.stagesMs } };
+        },
+    };
+};
+type ProcessingClock = ReturnType<typeof createProcessingClock>;
+
 export interface MeetingData {
     language: string;
     transcript_raw: string;
+    // Canonical when present. transcript_raw is a compatibility projection.
+    transcript_turns?: TurnSegment[];
+    transcript_encoding_original?: string; // audit copy for repaired raw-only legacy text
     minutes: MinuteData;
     tasks: Task[];
-    // Present when one or more chunks were skipped, or when the final analysis
-    // failed after a usable transcript had already been assembled.
+    // Includes review notices as well as skipped chunks / failed analysis.
     processing_warnings?: string[];
+    processing_timings?: ProcessingTimings; // observed durations only; absent on old records
+    analysis_review?: { minutes: boolean, tasks: boolean };
     // Records written before conference mode existed have no `mode`;
     // migrateMeetingData reads those as 'meeting'.
     mode: SessionMode;
@@ -533,16 +743,21 @@ const pad2 = (n: number) => String(n).padStart(2, '0');
 
 // Seconds -> "[MM:SS]" (or "[HH:MM:SS]" past the hour), matching the format the
 // app has always used. Negative means "unknown timestamp".
-const fmtTime = (sec: number): string => {
-    if (!isFinite(sec) || sec < 0) return '--:--';
+const isValidSeconds = (sec: unknown): sec is number =>
+    typeof sec === 'number' && Number.isFinite(sec) && sec >= 0;
+
+const fmtTime = (sec?: number): string => {
+    if (!isValidSeconds(sec)) return '--:--';
     const hh = Math.floor(sec / 3600), mm = Math.floor((sec % 3600) / 60), ss = Math.floor(sec % 60);
     return hh > 0 ? `${pad2(hh)}:${pad2(mm)}:${pad2(ss)}` : `${pad2(mm)}:${pad2(ss)}`;
 };
 
 // "MM:SS" or "HH:MM:SS" -> seconds.
 const parseTimeToSeconds = (stamp: string): number => {
+    if (!/^\d+:\d{2}(?:\.\d+)?$|^\d+:\d{2}:\d{2}(?:\.\d+)?$/.test(stamp)) return -1;
     const parts = stamp.split(':').map(Number);
-    if (parts.some(isNaN)) return -1;
+    if (parts.some(p => !Number.isFinite(p) || p < 0) || parts[parts.length - 1] >= 60) return -1;
+    if (parts.length === 3 && parts[1] >= 60) return -1;
     if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
     if (parts.length === 2) return parts[0] * 60 + parts[1];
     return -1;
@@ -565,19 +780,51 @@ const collapseLoops = (s: string): string =>
 // deliberately global — models routinely emit several turns on one line with
 // nothing but a space between them, and an anchored match silently merges them
 // all into the first speaker.
-const TURN_MARKER_RE = /\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*([^:\n\[\]]{2,40}?)\s*:\s+/g;
+const TURN_MARKER_RE = /\[(\d+:\d{2}(?::\d{2})?(?:\.\d+)?|--:--)\]\s*([^:\n\[\]]{1,120}?)\s*:\s+/g;
 
 // Guard against mistaking a colon inside a sentence for a speaker label.
 const looksLikeSpeaker = (candidate: string): boolean => {
     const name = candidate.trim();
+    const namedIdentity = name.match(/^(.{2,80})\s+\(Hablante \d+\)$/);
+    if (namedIdentity) return /^[\p{L}][\p{L}\p{M} .'-]+$/u.test(namedIdentity[1]) && namedIdentity[1].split(/\s+/).length <= 6;
+    if (/^[A-Z]$/.test(name)) return true;
     if (name.length < 2 || name.length > 40) return false;
     if (/[.?!;¿¡]/.test(name)) return false;           // sentence fragment, not a name
     if (name.split(/\s+/).length > 5) return false;    // real names are short
     return /^[A-ZÀ-ÞÑ0-9]/.test(name);                 // starts uppercase or digit
 };
 
+// Decode only literal byte-escape runs that form valid printable UTF-8 with
+// non-ASCII content. Leave code spans, ASCII escapes and invalid bytes intact.
+// Never use an eval/unicode_escape decoder over an entire transcript.
+const repairEscapedUtf8 = (s: string): string => s.replace(
+    /(```[\s\S]*?```|`[^`\n]*`)|((?:\\x[0-9a-f]{2})+)/gi,
+    (match, code, byteRun, offset) => {
+        if (code || s[offset - 1] === '\\') return match;
+        const bytes = Uint8Array.from(byteRun.match(/\\x([0-9a-f]{2})/gi).map((value: string) => parseInt(value.slice(2), 16)));
+        if (!bytes.some(b => b >= 0x80)) return match;
+        try {
+            const decoded = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+            return /[\u0000-\u001f\u007f]/.test(decoded) ? match : decoded;
+        } catch { return match; }
+    }
+);
+
+const repairHumanText = (value: any): any => {
+    if (typeof value === 'string') return repairEscapedUtf8(value);
+    if (Array.isArray(value)) return value.map(repairHumanText);
+    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, v]) => [key, repairHumanText(v)]));
+    return value;
+};
+
 const cleanTurnText = (s: string): string =>
-    s.replace(/^["″“”]+|["″“”]+$/g, '').replace(/\s+/g, ' ').trim();
+    repairEscapedUtf8(s).replace(/^["″“”]+|["″“”]+$/g, '').replace(/\s+/g, ' ').trim();
+
+const withRepairedTurnText = (turn: TurnSegment, originalText: string): TurnSegment => {
+    const repaired = repairEscapedUtf8(originalText);
+    return { ...turn, text: cleanTurnText(originalText),
+        textEncodingRepair: repaired !== originalText ? turn.textEncodingRepair || { kind: 'escaped-utf8', originalText } : turn.textEncodingRepair };
+};
 
 // Parse a raw transcript string back into turns. Handles three shapes:
 //   1. "[MM:SS] Name: text"  markers anywhere in the text (the normal case)
@@ -588,7 +835,7 @@ const parseTranscriptTurns = (raw: string): TurnSegment[] => {
     if (!raw || !raw.trim()) return [];
 
     const turns: TurnSegment[] = [];
-    let pending: { textFrom: number, startSec: number, speaker: string } | null = null;
+    let pending: { textFrom: number, startSec?: number, speaker: string } | null = null;
 
     TURN_MARKER_RE.lastIndex = 0;
     let m: RegExpExecArray | null;
@@ -596,36 +843,162 @@ const parseTranscriptTurns = (raw: string): TurnSegment[] => {
         if (!looksLikeSpeaker(m[2])) continue;  // e.g. "[01:10:27] Ahí lo importante..." — a bare timestamp
 
         if (pending) {
-            turns.push({ startSec: pending.startSec, speaker: pending.speaker, text: cleanTurnText(raw.slice(pending.textFrom, m.index)) });
+            turns.push(withRepairedTurnText({ startSec: pending.startSec, speaker: pending.speaker, text: '' }, raw.slice(pending.textFrom, m.index)));
         } else if (m.index > 0) {
-            const preamble = cleanTurnText(raw.slice(0, m.index));
-            if (preamble) turns.push({ startSec: -1, speaker: 'Desconocido', text: preamble });
+            const preamble = withRepairedTurnText({ speaker: 'Desconocido', text: '' }, raw.slice(0, m.index));
+            if (preamble.text) turns.push(preamble);
         }
-        pending = { textFrom: TURN_MARKER_RE.lastIndex, startSec: parseTimeToSeconds(m[1]), speaker: m[2].trim() };
+        const parsedTime = parseTimeToSeconds(m[1]);
+        pending = { textFrom: TURN_MARKER_RE.lastIndex, startSec: parsedTime >= 0 ? parsedTime : undefined, speaker: m[2].trim() };
     }
 
     if (pending) {
-        turns.push({ startSec: pending.startSec, speaker: pending.speaker, text: cleanTurnText(raw.slice(pending.textFrom)) });
+        turns.push(withRepairedTurnText({ startSec: pending.startSec, speaker: pending.speaker, text: '' }, raw.slice(pending.textFrom)));
         return turns.filter(t => t.text);
     }
 
     // No bracketed markers at all — fall back to line-based "Name: text".
     let current: TurnSegment | null = null;
     raw.split('\n').map(l => l.trim()).filter(Boolean).forEach(line => {
-        const head = line.match(/^([^:]{2,40}?)\s*:\s+(.*)$/);
+        const head = line.match(/^([^:]{1,120}?)\s*:\s+(.*)$/);
         if (head && looksLikeSpeaker(head[1])) {
             if (current) turns.push(current);
-            current = { startSec: -1, speaker: head[1].trim(), text: cleanTurnText(head[2]) };
+            current = withRepairedTurnText({ speaker: repairEscapedUtf8(head[1].trim()), text: '' }, head[2]);
         } else if (current) {
+            const originalText = (current.textEncodingRepair?.originalText || current.text) + ' ' + line;
             current.text = (current.text ? current.text + ' ' : '') + cleanTurnText(line);
+            if (repairEscapedUtf8(originalText) !== originalText) current.textEncodingRepair = { kind: 'escaped-utf8', originalText };
         } else {
-            current = { startSec: -1, speaker: 'Desconocido', text: cleanTurnText(line) };
+            current = withRepairedTurnText({ speaker: 'Desconocido', text: '' }, line);
         }
     });
     if (current) turns.push(current);
 
     return turns.filter(t => t.text);
 };
+
+// Shared by persistence, import, rename and exports; never edit the raw projection
+// independently. Old records without structured turns still use the legacy parser.
+const withTranscript = (meeting: MeetingData, turns: TurnSegment[]): MeetingData => ({
+    ...meeting, transcript_turns: turns, transcript_raw: serializeTranscript(turns),
+});
+
+const readStoredTurns = (value: unknown): TurnSegment[] => {
+    if (!Array.isArray(value)) throw new Error('La transcripción estructurada debe ser una lista.');
+    return value.map((t: any) => {
+        if (!t || typeof t.speaker !== 'string' || !t.speaker.trim() || typeof t.text !== 'string' || !t.text.trim()) {
+            throw new Error('Intervención estructurada sin hablante o texto válido.');
+        }
+        const warnings: string[] = Array.isArray(t.integrityWarnings)
+            ? t.integrityWarnings.filter((w: any) => typeof w === 'string') : [];
+        let startSec = isValidSeconds(t.startSec) ? t.startSec : undefined;
+        let endSec = isValidSeconds(t.endSec) && (startSec === undefined || t.endSec >= startSec) ? t.endSec : undefined;
+        if ((t.startSec != null && startSec === undefined) || (t.endSec != null && endSec === undefined)) {
+            warnings.push('Tiempo almacenado inválido; se conservó el texto sin ese tiempo.');
+        }
+        const s = t.source;
+        const validSource = s && typeof s.provider === 'string' && Number.isInteger(s.chunkIndex) && s.chunkIndex >= 0 &&
+            Number.isInteger(s.interventionIndex) && s.interventionIndex >= 0 &&
+            isValidSeconds(s.audioStartSec) && isValidSeconds(s.contentStartSec) && isValidSeconds(s.durationSec) &&
+            s.contentStartSec >= s.audioStartSec && s.contentStartSec <= s.audioStartSec + s.durationSec &&
+            ['api', 'generated', 'unavailable'].includes(s.timing);
+        const source = validSource ? {
+            provider: s.provider, chunkIndex: s.chunkIndex, interventionIndex: s.interventionIndex,
+            audioStartSec: s.audioStartSec, contentStartSec: s.contentStartSec, durationSec: s.durationSec, timing: s.timing,
+        } : undefined;
+        if (source) {
+            const outside = (time?: number) => time !== undefined && (time < source.audioStartSec || time > source.audioStartSec + source.durationSec);
+            if (outside(startSec)) { startSec = undefined; warnings.push('Inicio almacenado fuera del fragmento; se conservó el texto.'); }
+            if (outside(endSec)) { endSec = undefined; warnings.push('Fin almacenado fuera del fragmento; se conservó el texto.'); }
+        }
+        const decodedText = repairEscapedUtf8(t.text.trim());
+        return {
+            startSec, endSec, speaker: repairEscapedUtf8(t.speaker.trim()), text: decodedText, source,
+            sourceId: typeof t.sourceId === 'string' || (typeof t.sourceId === 'number' && Number.isFinite(t.sourceId)) ? t.sourceId : undefined,
+            integrityWarnings: warnings.length ? warnings : undefined,
+            overlapStatus: ['uncertain', 'prefix-trimmed'].includes(t.overlapStatus) ? t.overlapStatus : undefined,
+            localSpeakerId: typeof t.localSpeakerId === 'string' && t.localSpeakerId.trim() ? t.localSpeakerId : undefined,
+            speakerReferenceName: typeof t.speakerReferenceName === 'string' && t.speakerReferenceName.trim() ? t.speakerReferenceName : undefined,
+            speakerId: typeof t.speakerId === 'string' && t.speakerId.trim() ? t.speakerId : undefined,
+            speakerName: typeof t.speakerName === 'string' && t.speakerName.trim() ? repairEscapedUtf8(t.speakerName.trim()) : undefined,
+            speakerIdentityMethod: ['request-local', 'voice-reference', 'adjacent-overlap', 'manual'].includes(t.speakerIdentityMethod) ? t.speakerIdentityMethod : undefined,
+            speakerIdentityEvidence: t.speakerIdentityEvidence && typeof t.speakerIdentityEvidence === 'object' ? {
+                referenceName: typeof t.speakerIdentityEvidence.referenceName === 'string' ? t.speakerIdentityEvidence.referenceName : undefined,
+                referenceTiming: ['api', 'generated'].includes(t.speakerIdentityEvidence.referenceTiming) ? t.speakerIdentityEvidence.referenceTiming : undefined,
+                rejectedReferenceName: typeof t.speakerIdentityEvidence.rejectedReferenceName === 'string' ? t.speakerIdentityEvidence.rejectedReferenceName : undefined,
+                conflictingSpeakerIds: Array.isArray(t.speakerIdentityEvidence.conflictingSpeakerIds) ? t.speakerIdentityEvidence.conflictingSpeakerIds.filter((id: any) => typeof id === 'string' && id.trim()) : undefined,
+                previousChunkIndex: Number.isInteger(t.speakerIdentityEvidence.previousChunkIndex) && t.speakerIdentityEvidence.previousChunkIndex >= 0 ? t.speakerIdentityEvidence.previousChunkIndex : undefined,
+                anchors: Array.isArray(t.speakerIdentityEvidence.anchors) ? t.speakerIdentityEvidence.anchors.filter((a: any) =>
+                    Number.isInteger(a?.previousInterventionIndex) && a.previousInterventionIndex >= 0 && Number.isInteger(a?.currentInterventionIndex) && a.currentInterventionIndex >= 0) : undefined,
+            } : undefined,
+            speakerNameEvidence: t.speakerNameEvidence && ['self-introduction', 'direct-address-response', 'handoff-response', 'manual'].includes(t.speakerNameEvidence.kind) ? {
+                kind: t.speakerNameEvidence.kind,
+                turnIndices: Array.isArray(t.speakerNameEvidence.turnIndices) ? t.speakerNameEvidence.turnIndices.filter((i: any) => Number.isInteger(i) && i >= 0) : undefined,
+                quote: typeof t.speakerNameEvidence.quote === 'string' ? repairEscapedUtf8(t.speakerNameEvidence.quote) : undefined,
+            } : undefined,
+            textEncodingRepair: t.textEncodingRepair?.kind === 'escaped-utf8' && typeof t.textEncodingRepair.originalText === 'string'
+                ? { kind: 'escaped-utf8', originalText: t.textEncodingRepair.originalText } : decodedText !== t.text.trim() ? { kind: 'escaped-utf8', originalText: t.text } : undefined,
+            speakerCorrections: Array.isArray(t.speakerCorrections) ? t.speakerCorrections.filter((c: any) =>
+                ['reassign', 'merge', 'segment-map'].includes(c?.kind) && typeof c.previous?.speaker === 'string').map((c: any) => ({
+                    kind: c.kind,
+                    previous: (({ speaker, speakerId, speakerName, speakerIdentityMethod, speakerIdentityEvidence, speakerNameEvidence }) =>
+                        ({ speaker, speakerId, speakerName, speakerIdentityMethod, speakerIdentityEvidence, speakerNameEvidence }))(c.previous),
+                })) : undefined,
+        };
+    });
+};
+
+const meetingTurns = (meeting: Pick<MeetingData, 'transcript_raw' | 'transcript_turns'>): TurnSegment[] =>
+    meeting.transcript_turns ?? parseTranscriptTurns(meeting.transcript_raw);
+
+const turnWarnings = (turns: TurnSegment[]): string[] =>
+    Array.from(new Set(turns.flatMap(t => t.integrityWarnings || [])));
+
+const isOverlapNotice = (warning: string): boolean => /^(?:Segmento \d+\/\d+: )?Empalme incierto:/.test(warning);
+const processingNotice = (meeting: Pick<MeetingData, 'processing_warnings' | 'transcript_raw' | 'transcript_turns'>) => {
+    const warnings = meeting.processing_warnings || [];
+    const overlapWarnings = warnings.filter(isOverlapNotice);
+    const otherWarnings = warnings.filter(w => !isOverlapNotice(w));
+    const chunks = new Map<number, number | undefined>();
+    overlapWarnings.forEach(w => {
+        const match = w.match(/^Segmento (\d+)\/\d+:/);
+        if (match) chunks.set(Number(match[1]), undefined);
+    });
+    meetingTurns(meeting).forEach((t, index) => {
+        if (t.overlapStatus === 'uncertain' && t.source) {
+            const chunk = t.source.chunkIndex + 1;
+            if (chunks.get(chunk) === undefined) chunks.set(chunk, index);
+        }
+    });
+    const count = chunks.size;
+    const partial = otherWarnings.some(w => !w.startsWith('Análisis anterior:') && /no pudo transcribirse|omitido:|no se pudo generar|proceso se interrumpió/i.test(w));
+    const title = partial ? 'Resultado parcial' : overlapWarnings.length && !otherWarnings.length
+        ? count ? `Transcripción generada · ${count} ${count === 1 ? 'empalme por revisar' : 'empalmes por revisar'}`
+            : 'Transcripción generada · Empalmes por revisar'
+        : 'Resultado con advertencias';
+    return { title, overlapWarnings, otherWarnings, chunks: Array.from(chunks, ([chunk, turnIndex]) => ({ chunk, turnIndex })).sort((a, b) => a.chunk - b.chunk) };
+};
+
+const processingTimingRows = (timings: ProcessingTimings): { label: string, ms: number }[] =>
+    (Object.keys(PROCESSING_STAGE_LABELS) as ProcessingStage[]).filter(stage => timings.stagesMs[stage] !== undefined).map(stage => ({
+        label: stage === 'upload' && timings.uploadIncludesReadiness ? 'Subida y disponibilidad del archivo' : PROCESSING_STAGE_LABELS[stage],
+        ms: timings.stagesMs[stage]!,
+    }));
+const processingTimingNotes = (timings: ProcessingTimings): string => [
+    'Las llamadas API incluyen espera de red y respuesta; no miden únicamente inferencia remota.',
+    'El total incluye pausas y reintentos. Las etapas incluyen sus intentos fallidos y preparación o validación asociada.',
+    ...(timings.uploadCombinedWithApi ? ['Cuando no se pudo separar la subida, su tiempo está incluido en la API de transcripción.'] : []),
+].join(' ');
+
+const ProcessingTimingSummary: React.FC<{ timings?: ProcessingTimings }> = ({ timings }) => timings ? (
+    <details className="mb-6 rounded-2xl border border-white/10 bg-white/[0.02] px-5 py-4 text-xs text-slate-400">
+        <summary className="cursor-pointer text-slate-200">Tiempos medidos · Total {formatElapsed(timings.totalMs)}</summary>
+        <dl className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-2">
+            {processingTimingRows(timings).map(row => <div key={row.label} className="flex justify-between gap-4"><dt>{row.label}</dt><dd className="font-mono">{formatElapsed(row.ms)}</dd></div>)}
+        </dl>
+        <p className="mt-3 leading-relaxed">{processingTimingNotes(timings)}</p>
+    </details>
+) : null;
 
 // ==========================================
 // 3. GEMINI SERVICE
@@ -733,16 +1106,21 @@ const transcriptionSchema = {
                         type: ST.STRING,
                         description: "Marca de tiempo 'MM:SS' relativa al inicio de ESTE segmento (empieza en 00:00)."
                     },
+                    end: {
+                        type: ST.STRING,
+                        nullable: true,
+                        description: "Fin audible APROXIMADO de esta intervención, MM:SS relativo solo al audio principal. Usa null si no puedes ubicarlo. No copiar el inicio del siguiente turno."
+                    },
                     speaker: {
                         type: ST.STRING,
-                        description: "Nombre real del hablante, o etiqueta estable 'Hablante N'. Nunca vacío."
+                        description: "Etiqueta LOCAL 'Hablante N', consistente por voz dentro del audio principal. La comparación con muestras se entrega por separado en speaker_matches."
                     },
                     text: {
                         type: ST.STRING,
                         description: "Lo dicho por ese hablante en esa intervención."
                     },
                 },
-                required: ["time", "speaker", "text"],
+                required: ["time", "end", "speaker", "text"],
             },
         },
     },
@@ -758,10 +1136,13 @@ const speakerNamesSchema = {
             items: {
                 type: ST.OBJECT,
                 properties: {
-                    label: { type: ST.STRING, description: "Etiqueta genérica tal cual aparece, ej. 'Hablante A'." },
+                    speaker_id: { type: ST.STRING, description: "Identificador exacto de la voz en el contexto ordenado. No fusionar identificadores." },
                     name: { type: ST.STRING, description: "Nombre real, o cadena vacía si no hay evidencia clara." },
+                    evidence_type: { type: ST.STRING, enum: ['self-introduction', 'direct-address-response', 'handoff-response', 'none'] },
+                    turn_indices: { type: ST.ARRAY, items: { type: ST.INTEGER || 'INTEGER' }, description: "Índices exactos de una autopresentación o dos turnos adyacentes de llamada y respuesta." },
+                    quote: { type: ST.STRING, description: "Cita literal del turno que nombra a la persona. Vacía si no hay evidencia." },
                 },
-                required: ["label", "name"],
+                required: ["speaker_id", "name", "evidence_type", "turn_indices", "quote"],
             },
         },
     },
@@ -772,6 +1153,40 @@ const buildAudioPart = (audioSource: { uri?: string, inlineData?: any }, mimeTyp
     audioSource.uri
         ? { fileData: { mimeType, fileUri: audioSource.uri } }
         : { inlineData: audioSource.inlineData };
+
+const fitGeminiReferences = (source: { uri?: string, inlineData?: any }, references: VoiceReference[], preview?: Blob): VoiceReference[] => {
+    let remaining = 19000000 - (typeof source.inlineData?.data === 'string' ? source.inlineData.data.length : 0) - (preview ? 4 * Math.ceil(preview.size / 3) + 1000 : 0);
+    if (remaining < 0) throw new Error('El audio inline excede el presupuesto seguro de la solicitud; no se envió a transcribir.');
+    return references.slice(0, OPENAI_MAX_REFERENCES).filter(ref => {
+        const bytes = 4 * Math.ceil(ref.clip.size / 3) + 1000;
+        if (bytes > remaining) return false;
+        remaining -= bytes; return true;
+    });
+};
+
+const buildTranscriptionSchema = (references: VoiceReference[]) => ({
+    ...transcriptionSchema,
+    properties: {
+        ...transcriptionSchema.properties,
+        speaker_matches: {
+            type: ST.ARRAY,
+            description: "Una comparación acústica por voz local, no por turno. Sin muestras, []. No inferir por palabras, orden o nombres.",
+            items: {
+                type: ST.OBJECT,
+                properties: {
+                    speaker: { type: ST.STRING, description: "Etiqueta LOCAL exacta usada en segments." },
+                    reference: {
+                        type: ST.STRING, nullable: true,
+                        ...(references.length ? { enum: references.map(r => r.name) } : {}),
+                        description: "Token de la muestra cuya voz reconoces en el audio principal, o null si es otra voz o la comparación es incierta.",
+                    },
+                },
+                required: ["speaker", "reference"],
+            },
+        },
+    },
+    required: ["segments", "speaker_matches"],
+});
 
 // System prompt: turn an assembled transcript into minutes + tasks.
 //
@@ -828,56 +1243,54 @@ const conferenceAnalysisSystem = () => `
         ⚠️ FORMATO OBLIGATORIO: Responde ÚNICAMENTE con JSON válido según el esquema, sin preámbulos. NO devuelvas la transcripción, solo el análisis.
 `;
 
-// Transcription prompt with strong diarization + cross-segment speaker continuity.
-// The examples use the owner's own first name for the same reason the analysis
-// prompt does: a concrete, real name anchors the rule better than a placeholder.
-const transcriptionSystem = (knownSpeakers: string[], previousTail: string, mode: string = MODE_MEETING) => {
+// Local acoustic diarization only. Names and cross-request identity are handled
+// afterward; text context cannot stand in for audio from earlier requests.
+interface GeminiSpeakerContext {
+    previousLabels: string[];
+    confirmedNames: string[];
+}
+
+const transcriptionSystem = (speakerContext: GeminiSpeakerContext, previousTail: string, mode: string = MODE_MEETING, references: VoiceReference[] = []) => {
     const owner = getOwner();
-    const self = owner ? owner.firstName : 'Carlos';   // one side of the "no atribuyas por mención" examples
     const conference = isConference(mode);
+    // Reusing Hablante N in labelled history primes label/ordinal matching even
+    // with real acoustic samples. Preserve the words, without previous voice IDs.
+    const conversationalTail = previousTail ? parseTranscriptTurns(previousTail).map(t => t.text).join('\n') : '';
     return `
-        Estatuto: Eres un Estenógrafo Profesional de "Clean Read" (Lectura Limpia) con oído experto para DIARIZACIÓN (separación de hablantes).
-        Generas una transcripción fiel, detallada y optimizada para lectura ejecutiva.
-${conference ? `
-        NATURALEZA DEL AUDIO: es una CONFERENCIA o evento (charla, ponencia, panel, clase o webinar), no una reunión de trabajo.
-        - Un ponente puede sostener el turno durante varios minutos seguidos.
-        - Suele haber un moderador que presenta, cede la palabra y cierra.
-        - Puede haber preguntas del público, a menudo con micrófono lejano o mala calidad de audio.` : ''}
+        Transcribe fielmente el audio adjunto de ${conference ? 'una conferencia, charla, panel o clase' : 'una reunión'}.
+        FIDELIDAD:
+        - Conserva lo pronunciado: cifras, unidades, negaciones, nombres, compromisos, tecnicismos y matices.
+        - No resumas, parafrasees ni corrijas el sentido. Conserva repeticiones audibles, énfasis y autocorrecciones.
+        - No generes bucles de texto ausentes del audio. Escribe [inaudible] solo donde no puedas entender; continúa con lo audible.
+        - Escribe texto natural con tildes y signos Unicode, sin representar las letras como códigos o bytes.
 
-        DIARIZACIÓN (SEPARACIÓN DE HABLANTES) — PRIORIDAD MÁXIMA:
-        1. Distingue a cada persona por su voz (timbre, tono, cadencia) y asigna cada intervención al hablante correcto.
-        2. NOMBRES: Usa el nombre real cuando la persona se identifica, se le nombra o se le saluda ("Gracias, Ana", "${self}, ¿qué opinas?"). Si no hay nombre, usa etiquetas estables: "Hablante 1", "Hablante 2", etc.${conference ? `
-           En una conferencia la mejor evidencia es la presentación que hace el moderador ("nos acompaña la doctora Ana Ruiz") y la auto-presentación del ponente.
-           ⚠️ Aunque reconozcas el rol de alguien, la etiqueta sin nombre SIEMPRE es "Hablante N" — nunca "Ponente", "Moderador" ni "Público".` : ''}
-        3. CONSISTENCIA: La MISMA voz debe llevar SIEMPRE la MISMA etiqueta/nombre dentro de este segmento.
-        4. UNA ENTRADA POR INTERVENCIÓN: cada vez que cambia la voz, abre una entrada NUEVA en "segments". NUNCA metas dos hablantes distintos en la misma entrada.${conference ? `
-           Al revés también es un ERROR: NO partas un monólogo del ponente en entradas artificiales. Mientras siga hablando la misma voz, continúa la misma entrada.` : ' Es preferible dividir de más que de menos.'}
-        5. NO ATRIBUYAS POR MENCIÓN: que alguien diga "${self}" o "gracias, Ana" significa que habla DE esa persona, no que sea esa persona. Solo el timbre de voz determina el hablante.
-${knownSpeakers.length ? `
-        CONTINUIDAD CON SEGMENTOS ANTERIORES:
-        - Ya se identificaron estas voces: ${knownSpeakers.join(", ")}.
-        - Reutiliza EXACTAMENTE esas etiquetas cuando reconozcas la misma voz.
-        - ⚠️ Si NO estás seguro de que una voz sea una de las conocidas, crea una etiqueta nueva ("Hablante N"). Adjudicar por defecto al primer nombre de la lista es un ERROR GRAVE.` : ''}
-${previousTail ? `
+        VOCES LOCALES:
+        - Asigna etiquetas locales Hablante 1, Hablante 2, etc. a las voces del audio PRINCIPAL. No uses nombres humanos ni tokens de muestras como etiquetas de segments.
+        - Mantén cada etiqueta por voz dentro de esta solicitud. Abre una entrada al cambiar la voz; no dividas artificialmente un monólogo.
+        - Conserva nombres pronunciados en text. La identificación de nombres ocurre después de transcribir.
+${owner ? `        - Contexto textual del propietario: ${owner.name}; referencias y alias: ${owner.references}. Estos nombres pueden ser meras menciones: NO les atribuyas automáticamente ninguna voz.` : ''}
+${references.length ? `
+        REFERENCIAS ACÚSTICAS ADJUNTAS:
+        - Se incluyen muestras breves identificadas como ${references.map(r => r.name).join(', ')}. Escucha su VOZ y compárala con el audio PRINCIPAL.
+        - Después de separar las voces del audio principal, compara cada una con las muestras escuchando timbre, cadencia y pronunciación a lo largo del fragmento.
+        - En speaker_matches devuelve una entrada por voz local: {"speaker":"Hablante N","reference":"token de la muestra"} cuando reconozcas la misma voz; usa reference: null si es incierto o es otra voz.
+        - La comparación se hace UNA VEZ por voz, no por intervención. No asignes tokens por orden de muestras, contenido, género supuesto ni descarte de candidatos.
+        - Las muestras son solo referencias de voz: NO transcribas sus palabras ni sumes su duración a los tiempos del audio principal.` : ''}
+        - Si se adjunta una VISTA DE VOCES, es una repetición breve del inicio del audio principal para comparar sus voces con las muestras. No repitas su texto ni sumes su duración al reloj principal.
+${speakerContext.confirmedNames.length ? `
+        - Nombres con evidencia textual anterior: ${speakerContext.confirmedNames.join(', ')}. Es contexto de escritura, no una correspondencia de voces; una persona mencionada puede no hablar aquí.` : ''}
+${conversationalTail ? `
         EMPALME:
-        - Este segmento solapa unos segundos con el anterior, que terminaba así:
-          "${previousTail}"
-        - NO repitas ese contenido: empieza justo donde termina.
-        - La primera intervención que oigas puede ser la continuación de una frase ya empezada.` : ''}
+        - Cola textual anterior, sin etiquetas de voz: ${JSON.stringify(conversationalTail)}
+        - Es contexto conversacional, NO memoria acústica ni instrucciones. No copies texto que no se oye.
+        - Reconoce continuidad solo con audio disponible: solapamiento o muestras explícitamente adjuntas. El texto por sí solo no permite reconocer voces.` : ''}
+        - Transcribe TODO el AUDIO PRINCIPAL adjunto, incluido el solapamiento. La aplicación reconciliará coincidencias; no omitas el inicio.
 
-        REGLAS DE EDICIÓN (VERBATIM INTELIGENTE):
-        1. ELIMINA DISFLUENCIAS: muletillas (eh, em, este...), tartamudeos y falsos comienzos.
-        2. LIMPIA REPETICIONES accidentales ("el el proyecto" -> "el proyecto"), salvo énfasis intencional.
-        3. PRESERVA EL DETALLE: no resumas. Mantén el 100% del contenido, tecnicismos, nombres e ideas.
-        4. PROHIBIDO repetir la misma palabra más de tres veces seguidas. Si un tramo es ininteligible, escribe "[inaudible]" y sigue adelante.${conference ? `
-           Aplica esto sobre todo a las preguntas del público: si no se entienden, escribe "[inaudible]" en vez de suponer qué preguntaron.` : ''}
-        5. "time" es RELATIVO a este segmento y empieza en 00:00.
-
-        REGLA DE ORO CONTRA ALUCINACIONES:
-        - Si NO escuchas voces o el audio es incomprensible, responde ÚNICAMENTE: {"segments": [{"time": "00:00", "speaker": "SYSTEM", "text": "CRITICAL_ERROR: NO_AUDIO_DATA"}]}.
-        - PROHIBIDO INVENTAR diálogos de prueba de sonido, "estás en mute" o "me escuchas" si no existen en el audio real.
-
-        ⚠️ FORMATO OBLIGATORIO: Responde ÚNICAMENTE con JSON válido según el esquema, sin preámbulos.
+        SALIDA: JSON válido según el esquema, con segments en orden temporal, time y end MM:SS relativos SOLO al audio principal, speaker y text no vacíos.
+        Escribe end en CADA entrada: ubica el fin audible de ese turno escuchando el audio; es una estimación, no el inicio del siguiente turno. Si no puedes ubicarlo, escribe end: null.
+        Incluye speaker_matches. Sin muestras de voz adjuntas, devuelve [].
+        No inventes tiempos, palabras, nombres ni intervenciones. Para audio principal totalmente sin voces utilizables, devuelve
+        {"segments":[],"speaker_matches":[]}. No añadas avisos de sistema como intervenciones de la conversación.
 `;
 };
 
@@ -885,36 +1298,130 @@ ${previousTail ? `
 // model looped instead of transcribing (a real segment hit 70+).
 const MAX_CHARS_PER_SECOND = 35;
 
+interface TranscriptChunkContext {
+    provider: string;
+    chunkIndex: number;
+    audioStartSec: number;
+    contentStartSec: number;
+    durationSec: number;
+}
+
+const normalizeTimedTurn = (
+    start: unknown, end: unknown, speaker: string, text: string, sourceId: unknown,
+    context: TranscriptChunkContext, interventionIndex: number, timing: 'api' | 'generated'
+): TurnSegment => {
+    const warnings: string[] = [];
+    const validStart = isValidSeconds(start) && start <= context.durationSec;
+    const validEnd = isValidSeconds(end) && end <= context.durationSec && (!validStart || end >= start);
+    if (!validStart) warnings.push('Inicio inválido o fuera del fragmento; se conservó el texto sin ese tiempo.');
+    if (end != null && !validEnd) warnings.push('Fin inválido o fuera del fragmento; se conservó el texto sin ese tiempo.');
+    return {
+        startSec: validStart ? context.audioStartSec + start : undefined,
+        endSec: validEnd ? context.audioStartSec + end : undefined,
+        speaker, text,
+        sourceId: typeof sourceId === 'string' || (typeof sourceId === 'number' && Number.isFinite(sourceId)) ? sourceId : undefined,
+        source: { ...context, interventionIndex, timing },
+        integrityWarnings: warnings.length ? warnings : undefined,
+    };
+};
+
+const normalizeGeminiTurns = (res: any, context: TranscriptChunkContext, references: VoiceReference[] = []): TurnSegment[] => {
+    if (!res || !Array.isArray(res.segments)) {
+        throw new GeminiResponseError('format', 'Gemini no devolvió la estructura segments requerida.');
+    }
+    if (!res.segments.length) throw new NoAudioDetectedError();
+    // Legacy no-audio status entries are control metadata, never another voice.
+    // Keep genuine speech if a model incorrectly embeds a status beside it.
+    const segments = res.segments.map((segment: any, index: number) => ({ segment, index })).filter(({ segment: s }: any) =>
+        !(s?.speaker === 'SYSTEM' && typeof s.text === 'string' && /^(?:CRITICAL_ERROR:\s*)?(?:NO_AUDIO_DATA|NO_AUDIO_DETECTED)$/.test(s.text.trim())));
+    if (!segments.length) throw new NoAudioDetectedError();
+    const matches = new Map<string, string>();
+    const proposed = (Array.isArray(res.speaker_matches) ? res.speaker_matches : [])
+        .filter((m: any) => typeof m?.speaker === 'string').map((m: any) => ({ speaker: m.speaker.trim(), reference: m.reference }));
+    proposed.forEach((m: any) => {
+        if (typeof m?.speaker !== 'string' || typeof m.reference !== 'string' || !references.some(r => r.name === m.reference)) return;
+        // Ambiguous or many-to-one proposals never collapse distinct local voices.
+        if (proposed.filter((p: any) => p?.speaker === m.speaker).length !== 1 ||
+            proposed.filter((p: any) => p?.reference === m.reference).length !== 1) return;
+        matches.set(m.speaker.trim(), m.reference);
+    });
+    let latestStart: number | undefined;
+    const turns = segments.map(({ segment: s, index }: any) => {
+        if (!s || typeof s !== 'object' || !Object.prototype.hasOwnProperty.call(s, 'time') ||
+            typeof s.speaker !== 'string' || !s.speaker.trim() || typeof s.text !== 'string') {
+            throw new GeminiResponseError('format', 'Intervención de Gemini sin los campos time, speaker y text requeridos.');
+        }
+        const text = cleanTurnText(s.text);
+        if (!text) throw new GeminiResponseError('content', 'Gemini devolvió una intervención con texto vacío.');
+        const start = typeof s.time === 'string' ? parseTimeToSeconds(s.time.trim()) : undefined;
+        // Gemini endpoints remain generated estimates, never native measurements.
+        const end = typeof s.end === 'string' ? parseTimeToSeconds(s.end.trim()) : s.end;
+        const turn = normalizeTimedTurn(start, end, s.speaker.trim(), text, s.id, context, index, 'generated');
+        turn.localSpeakerId = s.speaker.trim();
+        turn.speakerReferenceName = matches.get(turn.localSpeakerId);
+        if (isValidSeconds(turn.startSec)) {
+            if (latestStart !== undefined && turn.startSec < latestStart - 3) {
+                turn.integrityWarnings = [...(turn.integrityWarnings || []), 'Retroceso temporal sospechoso de Gemini; se conservó el orden y el texto.'];
+            }
+            latestStart = Math.max(latestStart ?? turn.startSec, turn.startSec);
+        }
+        return withRepairedTurnText(turn, s.text);
+    });
+    if (segments.length !== res.segments.length) {
+        const last = turns[turns.length - 1];
+        last.integrityWarnings = [...(last.integrityWarnings || []), 'Gemini incluyó un aviso de sistema junto con habla; se conservó la transcripción disponible.'];
+    }
+    return turns;
+};
+
 // Transcribe one audio segment into absolute-timestamped turns.
 const transcribeAudioSegment = async (
     ai: any,
     audioSource: { uri?: string, inlineData?: any },
     mimeType: string,
-    knownSpeakers: string[],
+    speakerContext: GeminiSpeakerContext,
     previousTail: string,
-    offsetSec: number,
-    mode: string = MODE_MEETING
+    context: TranscriptChunkContext,
+    mode: string = MODE_MEETING,
+    references: VoiceReference[] = [],
+    voicePreview?: Blob
 ): Promise<TurnSegment[]> => {
+    const contentParts: any[] = [
+        { text: 'AUDIO PRINCIPAL: transcribe únicamente este audio. time y end empiezan en su propio 00:00.' },
+        buildAudioPart(audioSource, mimeType),
+    ];
+    for (const ref of references) {
+        contentParts.push({ text: `MUESTRA DE VOZ ${ref.name}; solo para comparar identidad, no transcribir.` });
+        contentParts.push({ inlineData: { mimeType: 'audio/wav', data: await blobToBase64(ref.clip) } });
+    }
+    if (voicePreview && references.length) {
+        contentParts.push({ text: 'VISTA DE VOCES: inicio del mismo audio principal. Escúchalo junto a las muestras para comparar voces; no es contenido nuevo ni otra transcripción.' });
+        contentParts.push({ inlineData: { mimeType: 'audio/wav', data: await blobToBase64(voicePreview) } });
+    }
     const res = await generateStructured(
         ai,
-        transcriptionSystem(knownSpeakers, previousTail, mode),
+        transcriptionSystem(speakerContext, previousTail, mode, references),
         "Realiza la transcripción completa y verbatim de este segmento de audio, separando a los hablantes en entradas distintas.",
-        buildAudioPart(audioSource, mimeType),
-        transcriptionSchema,
+        contentParts,
+        buildTranscriptionSchema(references),
         "TRANSCRIPTION"
     );
 
-    const rawSegments = (res && Array.isArray(res.segments)) ? res.segments : [];
-    return rawSegments
-        .map((s: any) => {
-            const rel = parseTimeToSeconds(String(s?.time || ''));
-            return {
-                startSec: (rel < 0 ? 0 : rel) + offsetSec,
-                speaker: String(s?.speaker || 'Desconocido').trim() || 'Desconocido',
-                text: cleanTurnText(String(s?.text || '')),
-            };
-        })
-        .filter((t: TurnSegment) => t.text);
+    return normalizeGeminiTurns(res, context, references);
+};
+
+const hasDegeneratePhrase = (text: string): boolean => {
+    const tokens = (text.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) || []);
+    if (text.length < 240) return false;
+    for (let width = 1; width <= Math.min(64, Math.floor(tokens.length / 8)); width++) {
+        let run = 0;
+        for (let i = width; i < tokens.length; i++) {
+            run = tokens[i] === tokens[i - width] ? run + 1 : 0;
+            // At least eight complete repetitions dominating the response.
+            if (run >= width * 7 && (run + width) / tokens.length > 0.6) return true;
+        }
+    }
+    return false;
 };
 
 // Reject a segment that degenerated into a repetition loop, so it can be retried.
@@ -923,19 +1430,27 @@ const sanitizeSegmentTurns = (turns: TurnSegment[], durationSec: number): TurnSe
     const before = turns.reduce((n, t) => n + t.text.length, 0);
     if (!before) return null;
 
-    const cleaned = turns
-        .map(t => ({ ...t, text: collapseLoops(t.text).replace(/\s+/g, ' ').trim() }))
-        .filter(t => t.text);
+    const cleaned = turns.map(t => ({ ...t, text: collapseLoops(t.text) }));
     const after = cleaned.reduce((n, t) => n + t.text.length, 0);
 
     const removedRatio = (before - after) / before;
     const charsPerSecond = durationSec > 0 ? before / durationSec : 0;
 
-    if (removedRatio > 0.2 || charsPerSecond > MAX_CHARS_PER_SECOND) {
+    const identical = new Map<string, { count: number, chars: number }>();
+    turns.forEach(t => {
+        const key = t.text.toLocaleLowerCase().replace(/\s+/g, ' ').trim();
+        const entry = identical.get(key) || { count: 0, chars: 0 };
+        entry.count++; entry.chars += t.text.length; identical.set(key, entry);
+    });
+    const repeatedTurns = Array.from(identical.entries()).some(([key, entry]) => key.length >= 40 && entry.count >= 8 && entry.chars / before > 0.8);
+    // A handful of emphatic words is not a poisoned chunk, even if it occupies
+    // a large fraction of a very short response.
+    if ((before >= 240 && removedRatio > 0.2) || charsPerSecond > MAX_CHARS_PER_SECOND || repeatedTurns || hasDegeneratePhrase(turns.map(t => t.text).join(' '))) {
         console.warn(`[TRANSCRIPTION] Degeneración detectada: ${Math.round(charsPerSecond)} car/s, ${Math.round(removedRatio * 100)}% del texto era repetición.`);
         return null;
     }
-    return cleaned;
+    // Detection is not editing: normal repetitions remain exactly as transcribed.
+    return turns;
 };
 
 // Turn an assembled transcript into { language, minutes, tasks, mode }.
@@ -953,7 +1468,7 @@ const analyzeTranscript = async (
     const conference = isConference(mode);
     const owner = getOwner();
 
-    const analysis = await generateStructured(
+    const rawAnalysis = await generateStructured(
         ai,
         conference ? conferenceAnalysisSystem() : analysisSystem(owner),
         (conference
@@ -968,69 +1483,110 @@ const analyzeTranscript = async (
     );
 
     return {
-        ...analysis,
+        ...repairHumanText(rawAnalysis),
         mode: conference ? MODE_CONFERENCE : MODE_MEETING,
-        tasks: conference ? [] : (Array.isArray(analysis?.tasks) ? analysis.tasks : []),
+        tasks: conference ? [] : (Array.isArray(rawAnalysis?.tasks) ? repairHumanText(rawAnalysis.tasks) : []),
     };
 };
 
-// Map generic speaker labels ("Hablante A") onto the real names people use in
-// the conversation. OpenAI returns bare A/B/C, and Gemini falls back to
-// "Hablante N" whenever nobody is addressed by name early on.
+const speakerKey = (turn: TurnSegment): string => turn.speakerId || `legacy:${turn.speaker}`;
+const genericSpeakerLabel = (turn: TurnSegment): string =>
+    turn.speakerId?.match(/^speaker_(\d+)$/) ? `Hablante ${turn.speakerId.slice(8)}` : turn.speaker;
+
+const orderedNameContext = (turns: TurnSegment[]): { text: string, indices: Set<number> } => {
+    const selected = new Set<number>();
+    const addNeighbors = (index: number) => {
+        for (let i = Math.max(0, index - 1); i <= Math.min(turns.length - 1, index + 1); i++) selected.add(i);
+    };
+    turns.slice(0, 20).forEach((_t, i) => selected.add(i));
+    const perIdentity = new Map<string, number>();
+    turns.forEach((t, i) => {
+        const key = speakerKey(t), count = perIdentity.get(key) || 0;
+        if (count < 2) addNeighbors(i);
+        perIdentity.set(key, count + 1);
+        if (/\b(me llamo|mi nombre es|soy|les habla|adelante|palabra|puedes|podrías)\b/i.test(t.text)) addNeighbors(i);
+    });
+    const indices = new Set<number>();
+    let text = '';
+    for (const i of Array.from(selected).sort((a, b) => a - b)) {
+        const t = turns[i];
+        const line = `${i} | ${speakerKey(t)} | fragmento ${t.source?.chunkIndex ?? 'importado'} | ${t.text.slice(0, 800)}\n`;
+        if (text.length + line.length > 18000) break;
+        text += line; indices.add(i);
+    }
+    return { text, indices };
+};
+
+const validateSpeakerNameEvidence = (mapping: any, turns: TurnSegment[], shown: Set<number>): TurnSegment['speakerNameEvidence'] | null => {
+    if (typeof mapping?.speaker_id !== 'string' || typeof mapping?.name !== 'string' || !mapping.name.trim() ||
+        typeof mapping.quote !== 'string' || !mapping.quote.trim() || !Array.isArray(mapping.turn_indices)) return null;
+    const indices = mapping.turn_indices;
+    if (indices.some((i: any) => !Number.isInteger(i) || !shown.has(i) || !turns[i])) return null;
+    const name = mapping.name.trim(), quote = mapping.quote.trim();
+    if (name.length < 2 || name.length > 80 || name.split(/\s+/).length > 6 || !/^[\p{L}][\p{L}\p{M} .'-]+$/u.test(name)) return null;
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const nameEnd = '(?=$|[^\\p{L}\\p{N}])';
+    if (!new RegExp(escaped + nameEnd, 'iu').test(quote)) return null;
+    if (mapping.evidence_type === 'self-introduction' && indices.length === 1) {
+        const t = turns[indices[0]];
+        const intro = new RegExp(`(?:^|[.!?]\\s+)(?:(?:hola|buenos días|buenas tardes|yo)[, ]+)?(?:me llamo|mi nombre es|soy|les habla)\\s+${escaped}${nameEnd}`, 'iu');
+        if (speakerKey(t) !== mapping.speaker_id || !t.text.includes(quote) || !intro.test(t.text)) return null;
+    } else if (['direct-address-response', 'handoff-response'].includes(mapping.evidence_type) && indices.length === 2 && indices[1] === indices[0] + 1) {
+        const before = turns[indices[0]], after = turns[indices[1]];
+        if (speakerKey(before) === mapping.speaker_id || speakerKey(after) !== mapping.speaker_id ||
+            before.source?.chunkIndex !== after.source?.chunkIndex || !before.text.includes(quote)) return null;
+        const address = mapping.evidence_type === 'handoff-response'
+            ? new RegExp(`(?:adelante[, ]+|tiene la palabra\\s+|cedo la palabra a\\s+|escuchemos a\\s+)${escaped}${nameEnd}`, 'iu')
+            : new RegExp(`(?:^|[,¿¡]\\s*|\\boye\\s+)${escaped}${nameEnd}[,\\s¿]+.*[?¿]`, 'iu');
+        if (!address.test(quote)) return null;
+    } else return null;
+    return { kind: mapping.evidence_type, turnIndices: [...indices], quote };
+};
+
+// This existing text-only call names identities; it never merges their voices.
 const resolveSpeakerNames = async (ai: any, turns: TurnSegment[]): Promise<TurnSegment[]> => {
-    const generic = Array.from(new Set(turns.map(t => t.speaker)))
-        .filter(label => /^(hablante|speaker)\b/i.test(label) || /^[A-Z]$/.test(label));
-    if (!generic.length) return turns;
-
-    // Give the model a representative sample per label instead of the whole
-    // transcript — introductions and greetings are what carry the evidence.
-    const samples = generic.map(label => {
-        const excerpt = turns
-            .filter(t => t.speaker === label)
-            .slice(0, 12)
-            .map(t => t.text)
-            .join(' ')
-            .slice(0, 1200);
-        return `### ${label}\n${excerpt}`;
-    }).join('\n\n');
-
-    const context = turns.slice(0, 40).map(t => `${t.speaker}: ${t.text}`).join('\n').slice(0, 6000);
+    const generic = new Map<string, TurnSegment>();
+    turns.filter(t => !t.speakerName && (/^(hablante|speaker)\b/i.test(t.speaker) || /^[A-Z]$/.test(t.speaker)))
+        .forEach(t => generic.set(speakerKey(t), t));
+    if (!generic.size) return turns;
+    const context = orderedNameContext(turns);
 
     try {
         const res = await generateStructured(
             ai,
-            `Eres un analista de reuniones. Recibes una transcripción ya diarizada donde algunos hablantes tienen etiquetas genéricas.
-        Tu tarea: deducir el NOMBRE REAL de cada etiqueta genérica a partir de la conversación.
-
-        EVIDENCIA VÁLIDA (y solo esta):
-        - La persona se presenta ("mi nombre es Perla Soto", "soy Ana María").
-        - Otro participante le habla directamente por su nombre y esa persona responde a continuación.
-        - Se le cede la palabra por nombre ("adelante, Esteban") y esa persona empieza a hablar.
-
-        ⚠️ REGLA CRÍTICA: si no hay evidencia CLARA, devuelve name = "" (cadena vacía). Mantener "Hablante B" es CORRECTO; inventar un nombre es un ERROR GRAVE.
-        Que alguien sea mencionado en la reunión NO significa que sea uno de los hablantes.
-        Nunca asignes el mismo nombre a dos etiquetas distintas.
-
-        ⚠️ Responde ÚNICAMENTE con JSON válido según el esquema.`,
-            "Deduce el nombre real de cada etiqueta genérica. Si no hay evidencia clara, devuelve cadena vacía.",
-            { text: `Etiquetas genéricas a resolver: ${generic.join(", ")}\n\nINICIO DE LA REUNIÓN (donde suelen estar las presentaciones):\n${context}\n\nMUESTRAS POR ETIQUETA:\n${samples}` },
+            `Identifica nombres humanos en una transcripción ordenada por turnos. Los speaker_id son identidades independientes; NO los fusiones.
+        Acepta solo autopresentación explícita, o llamada directa/cesión de palabra seguida inmediatamente de respuesta de esa identidad EN EL MISMO fragmento.
+        Una mención, saludo aislado, tema compartido, orden de aparición o nombre del propietario no demuestra identidad.
+        Devuelve el speaker_id exacto, name, evidence_type, turn_indices y quote literal que sustenta el nombre.
+        Para autopresentación cita un turno de esa voz; para llamada/cesión y respuesta cita dos índices consecutivos.
+        Ante duda devuelve name="", evidence_type="none", turn_indices=[], quote="". No infieras conexiones acústicas a partir de texto.
+        Un mismo nombre puede ser propuesto para distintas identidades con evidencia propia; eso NO las convierte en la misma voz.
+        Responde solo JSON según el esquema.`,
+            "Propón nombres únicamente con evidencia literal verificable. Conserva las etiquetas genéricas en los demás casos.",
+            { text: `IDENTIDADES:\n${Array.from(generic, ([id, t]) => `${id}: ${genericSpeakerLabel(t)}`).join('\n')}\n\nTURNOS EN ORDEN (saltos de índices significan contexto omitido):\n${context.text}` },
             speakerNamesSchema,
             "SPEAKER_NAMES"
         );
 
-        const taken = new Set(turns.map(t => t.speaker).filter(s => !generic.includes(s)));
-        const map: Record<string, string> = {};
-        (res?.mappings || []).forEach((m: any) => {
-            const label = String(m?.label || '').trim();
-            const name = String(m?.name || '').trim();
-            if (!label || !name || !generic.includes(label) || taken.has(name)) return;
-            map[label] = name;
-            taken.add(name);
+        const names = new Map<string, { name: string, evidence: NonNullable<TurnSegment['speakerNameEvidence']> }>();
+        const conflicting = new Set<string>();
+        (Array.isArray(res?.mappings) ? res.mappings : []).forEach((m: any) => {
+            m = repairHumanText(m);
+            if (!generic.has(m?.speaker_id) || conflicting.has(m.speaker_id)) return;
+            const evidence = validateSpeakerNameEvidence(m, turns, context.indices);
+            if (!evidence) return;
+            const previous = names.get(m.speaker_id);
+            if (previous && previous.name.toLocaleLowerCase() !== m.name.trim().toLocaleLowerCase()) {
+                names.delete(m.speaker_id); conflicting.add(m.speaker_id); return;
+            }
+            names.set(m.speaker_id, { name: m.name.trim(), evidence });
         });
-
-        if (!Object.keys(map).length) return turns;
-        console.log('[SPEAKER_NAMES] Etiquetas resueltas:', map);
-        return turns.map(t => (map[t.speaker] ? { ...t, speaker: map[t.speaker] } : t));
+        return turns.map(t => {
+            const resolved = names.get(speakerKey(t));
+            if (!resolved) return t;
+            return { ...t, speakerName: resolved.name, speakerNameEvidence: resolved.evidence,
+                speaker: t.speakerId ? `${resolved.name} (${genericSpeakerLabel(t)})` : resolved.name };
+        });
     } catch (err) {
         // Never let a cosmetic pass sink a finished transcription.
         console.warn('[SPEAKER_NAMES] No se pudieron resolver los nombres, se mantienen las etiquetas:', err);
@@ -1038,18 +1594,37 @@ const resolveSpeakerNames = async (ai: any, turns: TurnSegment[]): Promise<TurnS
     }
 };
 
-// Entry point for the "Cargar Transcripción" (text file) flow.
-const processTextWithGemini = async (rawText: string, mode: string = MODE_MEETING): Promise<MeetingData> => {
-    const ai = new GenAI({ apiKey: getGeminiKey() });
-    // Normalize pasted transcripts too, so they get one turn per line like the rest.
-    const turns = parseTranscriptTurns(rawText);
-    const normalized = turns.length ? serializeTranscript(turns) : rawText;
-    const analysis = await analyzeTranscript(ai, normalized, mode);
+const analyzeImportedTurns = async (turns: TurnSegment[], mode: string, warnings: string[] = [], clock?: ProcessingClock): Promise<MeetingData> => {
+    if (!turns.length) throw new Error('El archivo no contiene intervenciones.');
+    clock?.start('analysis');
+    try {
+        const ai = new GenAI({ apiKey: getGeminiKey() });
+        const analysis = await analyzeTranscript(ai, serializeTranscript(turns), mode, warnings.length > 0);
+        return withTranscript({ ...analysis, processing_warnings: warnings, processing_timings: clock?.finish() } as MeetingData, turns);
+    } catch {
+        // An analysis failure must not discard an already available transcript.
+        return withTranscript({
+            language: '', transcript_raw: '', minutes: { decisions: [], discussion_points: [], participants: [], full_summary_text: '' },
+            tasks: [], mode: isConference(mode) ? MODE_CONFERENCE : MODE_MEETING,
+            processing_warnings: [...warnings, 'No se pudo generar el análisis de la transcripción importada; el texto fue conservado.'],
+            processing_timings: clock?.finish(),
+        }, turns);
+    }
+};
 
-    return {
-        ...analysis,
-        transcript_raw: normalized
-    } as MeetingData;
+// Entry point for the "Cargar Transcripción" (text file) flow.
+const processTextWithGemini = async (rawText: string, mode: string = MODE_MEETING, clock?: ProcessingClock): Promise<MeetingData> =>
+    analyzeImportedTurns(parseTranscriptTurns(rawText), mode, [], clock);
+
+const processStructuredTranscript = async (rawJSON: string, mode: string, clock?: ProcessingClock): Promise<MeetingData> => {
+    const imported = JSON.parse(rawJSON);
+    const turns = readStoredTurns(imported?.transcript_turns);
+    if (!turns.length) throw new Error('El archivo no contiene intervenciones.');
+    const warnings = Array.from(new Set([
+        ...(Array.isArray(imported.processing_warnings) ? imported.processing_warnings.filter((w: any) => typeof w === 'string') : []),
+        ...turnWarnings(turns),
+    ])) as string[];
+    return analyzeImportedTurns(turns, mode, warnings, clock);
 };
 
 // ==========================================
@@ -1069,7 +1644,7 @@ const getOpenAIKey = (): string => {
 //
 // gpt-transcribe returns plain text only — no speakers, and no timestamps either
 // (verbose_json is rejected: "not compatible ... Use 'json' or 'text'"). A whole
-// segment therefore becomes ONE turn stamped at the segment's own start. Nothing
+// segment therefore becomes ONE untimed turn with chunk provenance. Nothing
 // here may invent a speaker or a finer timestamp than the API actually gave.
 //
 // gpt-4o-transcribe-diarize returns segments[] with speaker/start/end. Its labels
@@ -1086,12 +1661,33 @@ const blobToDataURL = (blob: Blob): Promise<string> => new Promise((resolve, rej
     reader.readAsDataURL(blob);
 });
 
+const normalizeOpenAITurns = (body: any, diarizing: boolean, context: TranscriptChunkContext): TurnSegment[] => {
+    const segments = diarizing && Array.isArray(body?.segments) ? body.segments : [];
+    if (!segments.length) {
+        if (typeof body?.text !== 'string' || !body.text.trim()) return [];
+        // GPT Transcribe (and a text-only fallback) has NO internal timestamps.
+        return [{
+            speaker: OPENAI_UNKNOWN_SPEAKER, text: cleanTurnText(body.text),
+            source: { ...context, interventionIndex: 0, timing: 'unavailable' },
+        }];
+    }
+    return segments.map((s: any, index: number) => {
+        if (!s || typeof s.text !== 'string' || !s.text.trim()) throw new Error('OpenAI devolvió una intervención sin texto válido.');
+        const raw = typeof s.speaker === 'string' && s.speaker.trim() ? s.speaker.trim() : OPENAI_UNKNOWN_SPEAKER;
+        const turn = normalizeTimedTurn(s.start, s.end,
+            /^[A-Za-z]$/.test(raw) ? `Hablante ${raw.toUpperCase()}` : raw,
+            cleanTurnText(s.text), s.id, context, index, 'api');
+        return { ...turn, localSpeakerId: raw };
+    });
+};
+
 const transcribeWithOpenAI = async (
     provider: string,
     blob: Blob,
-    offsetSec: number,
+    context: TranscriptChunkContext,
     onProgress: (pct: number) => void,
-    references: { name: string, clip: Blob }[] = []
+    references: VoiceReference[] = [],
+    onTransportStage?: (stage: 'upload' | 'transcription' | 'complete') => void
 ): Promise<TurnSegment[]> => {
     const apiKey = getOpenAIKey();
     const spec = PROVIDERS[provider];
@@ -1124,7 +1720,9 @@ const transcribeWithOpenAI = async (
         xhr.upload.onprogress = (e) => {
             if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
         };
+        xhr.upload.onload = () => onTransportStage?.('transcription');
         xhr.onload = () => {
+            onTransportStage?.('complete');
             try {
                 const parsed = JSON.parse(xhr.responseText);
                 if (xhr.status >= 200 && xhr.status < 300) return resolve(parsed);
@@ -1138,33 +1736,11 @@ const transcribeWithOpenAI = async (
             "No se pudo contactar con api.openai.com. Si la API Key es correcta, lo más probable es que el navegador " +
             "esté bloqueando la petición por CORS; en ese caso hay que enrutar la llamada por server.pyw."
         ));
+        onTransportStage?.('upload');
         xhr.send(form);
     });
 
-    if (!diarizing) {
-        const text = cleanTurnText(String(body?.text || ''));
-        return text ? [{ startSec: offsetSec, speaker: OPENAI_UNKNOWN_SPEAKER, text }] : [];
-    }
-
-    const segments = Array.isArray(body?.segments) ? body.segments : [];
-    if (!segments.length && body?.text) {
-        // Shouldn't happen with diarized_json, but never throw away a transcript.
-        return [{ startSec: offsetSec, speaker: OPENAI_UNKNOWN_SPEAKER, text: cleanTurnText(String(body.text)) }];
-    }
-
-    return segments
-        .map((s: any) => {
-            // Unrecognized voices come back as bare letters ("A"); voices matched
-            // against a reference come back with the name we supplied, already
-            // in final form.
-            const raw = String(s?.speaker || '?').trim();
-            return {
-                startSec: Math.round(Number(s?.start) || 0) + offsetSec,
-                speaker: /^[A-Za-z]$/.test(raw) ? `Hablante ${raw.toUpperCase()}` : raw,
-                text: cleanTurnText(String(s?.text || '')),
-            };
-        })
-        .filter((t: TurnSegment) => t.text);
+    return normalizeOpenAITurns(body, diarizing, context);
 };
 
 // Wrap already-encoded 16-bit mono PCM in a WAV container.
@@ -1190,48 +1766,150 @@ const wrapPCM16 = (pcm: ArrayBuffer, sampleRate: number): Blob => {
 };
 
 // OpenAI labels speakers per REQUEST, so segment 2's "A" is not segment 1's "A".
-// Build short voice references from the first segment and pass them along, which
-// is exactly what known_speaker_names/known_speaker_references are for. Without
-// this, splitting a recording would silently scramble who said what.
+// OpenAI clips require native validated intervals. Gemini opts into explicitly
+// generated endpoints with larger margins. Never derive speech from the next start.
 const OPENAI_MAX_REFERENCES = 4;   // API limit
 const REFERENCE_CLIP_SECONDS = 6;  // must land in the API's 2-10 s window
+const GEMINI_REFERENCE_CLIP_SECONDS = 10;
+const OPENAI_REFERENCE_CACHE_SIZE = 8;
+const REFERENCE_EDGE_MARGIN_SEC = 0.15;
+
+const referencePCMQuality = (pcm: ArrayBuffer): { rms: number, activeFraction: number } | null => {
+    const view = new DataView(pcm);
+    const count = pcm.byteLength / 2, frameSamples = Math.round(TARGET_SAMPLE_RATE * 0.02);
+    let energy = 0, clipped = 0, active = 0, frames = 0;
+    for (let from = 0; from < count; from += frameSamples) {
+        const to = Math.min(count, from + frameSamples);
+        let frameEnergy = 0;
+        for (let i = from; i < to; i++) {
+            const value = view.getInt16(i * 2, true) / 32768;
+            frameEnergy += value * value;
+            if (Math.abs(value) >= 0.999) clipped++;
+        }
+        energy += frameEnergy; frames++;
+        if (Math.sqrt(frameEnergy / (to - from)) >= 0.01) active++;
+    }
+    const rms = Math.sqrt(energy / count), activeFraction = active / frames;
+    // Signal controls, not speaker recognition or a confidence score.
+    if (!Number.isFinite(rms) || rms < 0.006 || activeFraction < 0.5 || clipped / count > 0.01) return null;
+    return { rms, activeFraction };
+};
+
+// Optional short acoustic context for long Gemini inputs, never a second full
+// recording or a speaker-labelled reference. The main audio is still transcribed once.
+const buildGeminiVoicePreview = async (chunkWav: Blob): Promise<Blob | undefined> => {
+    if (chunkWav.size < 44) return undefined;
+    const header = new DataView(await chunkWav.slice(0, 44).arrayBuffer());
+    const ascii = (offset: number, count: number) => Array.from({ length: count }, (_, i) => String.fromCharCode(header.getUint8(offset + i))).join('');
+    if (ascii(0, 4) !== 'RIFF' || ascii(8, 4) !== 'WAVE' || ascii(12, 4) !== 'fmt ' || ascii(36, 4) !== 'data' ||
+        header.getUint32(16, true) !== 16 || header.getUint16(20, true) !== 1 || header.getUint16(22, true) !== 1 ||
+        header.getUint32(24, true) !== TARGET_SAMPLE_RATE || header.getUint16(34, true) !== 16) return undefined;
+    const dataBytes = header.getUint32(40, true);
+    if (dataBytes % 2 || dataBytes > chunkWav.size - 44 || dataBytes / (2 * TARGET_SAMPLE_RATE) <= 180) return undefined;
+    return wrapPCM16(await chunkWav.slice(44, 44 + Math.min(dataBytes, 40 * TARGET_SAMPLE_RATE * 2)).arrayBuffer(), TARGET_SAMPLE_RATE);
+};
 
 const buildSpeakerReferences = async (
     chunkWav: Blob,
     turns: TurnSegment[],
-    audioStartSec: number
-): Promise<{ name: string, clip: Blob }[]> => {
+    audioStartSec: number,
+    registry: SpeakerRegistry,
+    timing: 'api' | 'generated' = 'api'
+): Promise<VoiceReference[]> => {
     const HEADER_BYTES = 44;
-    const bytesPerSecond = TARGET_SAMPLE_RATE * 2;
-
-    // Rank speakers by how much they talk, then take each one's longest turn.
-    const bySpeaker = new Map<string, { chars: number, best: TurnSegment, span: number }>();
-    turns.forEach((t, i) => {
-        const span = (turns[i + 1] ? turns[i + 1].startSec : t.startSec + REFERENCE_CLIP_SECONDS) - t.startSec;
-        const entry = bySpeaker.get(t.speaker);
-        if (!entry) bySpeaker.set(t.speaker, { chars: t.text.length, best: t, span });
-        else {
-            entry.chars += t.text.length;
-            if (span > entry.span) { entry.best = t; entry.span = span; }
-        }
+    if (!turns.length || !isValidSeconds(audioStartSec) || chunkWav.size < HEADER_BYTES ||
+        turns.some(t => t.source?.timing !== timing)) return [];
+    const hasUsableBounds = (t: TurnSegment): boolean =>
+        t.source?.audioStartSec === audioStartSec && isValidSeconds(t.startSec) && isValidSeconds(t.endSec) && t.endSec > t.startSec && !t.integrityWarnings?.length;
+    if (timing === 'api' && turns.some(t => !hasUsableBounds(t))) return []; // native OpenAI policy stays strict
+    const header = new DataView(await chunkWav.slice(0, HEADER_BYTES).arrayBuffer());
+    const ascii = (offset: number, length: number) => Array.from({ length }, (_, i) => String.fromCharCode(header.getUint8(offset + i))).join('');
+    if (ascii(0, 4) !== 'RIFF' || ascii(8, 4) !== 'WAVE' || ascii(12, 4) !== 'fmt ' || ascii(36, 4) !== 'data' ||
+        header.getUint32(16, true) !== 16 || header.getUint16(20, true) !== 1 || header.getUint16(22, true) !== 1 ||
+        header.getUint32(24, true) !== TARGET_SAMPLE_RATE || header.getUint16(34, true) !== 16) return [];
+    const dataBytes = header.getUint32(40, true);
+    if (dataBytes % 2 || dataBytes > chunkWav.size - HEADER_BYTES) return [];
+    const totalSamples = dataBytes / 2;
+    // Native responses retain their strict full-turn overlap policy. Generated
+    // boundaries are screened against the actual sample window, not a later
+    // overlap elsewhere in a long turn. Never manufacture a missing endpoint.
+    const overlapsSample = (from: number, to: number, other: TurnSegment): boolean => {
+        const startKnown = isValidSeconds(other.startSec), endKnown = isValidSeconds(other.endSec);
+        if (startKnown && endKnown) return other.startSec! < to && other.endSec! > from;
+        if (startKnown) return other.startSec! >= from && other.startSec! < to;
+        if (endKnown) return other.endSec! > from && other.endSec! <= to;
+        return true; // wholly unlocated speech cannot establish a clean sample
+    };
+    const intervals: (TurnSegment & { members: TurnSegment[] })[] = [];
+    turns.forEach(t => {
+        if (!hasUsableBounds(t) || !t.speakerId) return;
+        const last = intervals[intervals.length - 1];
+        // Consecutive same-voice intervals may form one sample only when their
+        // supplied boundaries touch exactly. No gap/short turn is stretched.
+        if (timing === 'generated' && last && last.speakerId === t.speakerId && last.endSec === t.startSec &&
+            last.source!.provider === t.source!.provider && last.source!.chunkIndex === t.source!.chunkIndex &&
+            last.members[last.members.length - 1].source!.interventionIndex + 1 === t.source!.interventionIndex) {
+            last.endSec = t.endSec; last.members.push(t);
+        } else intervals.push({ ...t, members: [t] });
     });
-
-    const ranked = Array.from(bySpeaker.entries())
-        .sort((a, b) => b[1].chars - a[1].chars)
-        .slice(0, OPENAI_MAX_REFERENCES);
-
-    const references: { name: string, clip: Blob }[] = [];
-    for (const [name, info] of ranked) {
-        // Skip half a second of lead-in so the clip is not clipped mid-consonant.
-        const fromSec = Math.max(0, info.best.startSec - audioStartSec + 0.5);
-        const takeSec = Math.min(REFERENCE_CLIP_SECONDS, Math.max(2, info.span - 0.5));
-        const from = HEADER_BYTES + Math.floor(fromSec) * bytesPerSecond;
-        const to = Math.min(chunkWav.size, from + Math.ceil(takeSec) * bytesPerSecond);
-        if (to - from < 2 * bytesPerSecond) continue; // under 2 s, the API rejects it
-        references.push({ name, clip: wrapPCM16(await chunkWav.slice(from, to).arrayBuffer(), TARGET_SAMPLE_RATE) });
+    const eligible = intervals.filter(t => !registry.references.has(t.speakerId!) &&
+        (timing === 'generated' || !turns.some(other => !t.members.includes(other) && overlapsSample(t.startSec!, t.endSec!, other))))
+        .sort((a, b) => timing === 'generated'
+            ? a.startSec! - b.startSec! || (b.endSec! - b.startSec!) - (a.endSec! - a.startSec!)
+            : (b.endSec! - b.startSec!) - (a.endSec! - a.startSec!));
+    const references: VoiceReference[] = [];
+    const captured = new Set<string>();
+    const edgeMargin = timing === 'generated' ? 0.75 : REFERENCE_EDGE_MARGIN_SEC;
+    for (const turn of eligible) {
+        if (captured.has(turn.speakerId!)) continue;
+        if (references.length >= OPENAI_REFERENCE_CACHE_SIZE) break;
+        const from = Math.max(0, Math.ceil((turn.startSec! - audioStartSec + edgeMargin) * TARGET_SAMPLE_RATE));
+        const limit = Math.min(totalSamples, Math.floor((turn.endSec! - audioStartSec - edgeMargin) * TARGET_SAMPLE_RATE));
+        const to = Math.min(limit, from + (timing === 'generated' ? GEMINI_REFERENCE_CLIP_SECONDS : REFERENCE_CLIP_SECONDS) * TARGET_SAMPLE_RATE);
+        if (to - from < (timing === 'generated' ? 4 : 2) * TARGET_SAMPLE_RATE) continue;
+        if (timing === 'generated' && turns.some(other => !turn.members.includes(other) &&
+            overlapsSample(audioStartSec + from / TARGET_SAMPLE_RATE, audioStartSec + to / TARGET_SAMPLE_RATE, other))) continue;
+        const pcm = await chunkWav.slice(HEADER_BYTES + from * 2, HEADER_BYTES + to * 2).arrayBuffer();
+        const quality = referencePCMQuality(pcm);
+        if (!quality) continue;
+        const record = registry.speakers.get(turn.speakerId!)!;
+        // Gemini tokens carry no number resembling Hablante N. Keep a token
+        // stable across cache rotation; OpenAI's established tokens stay intact.
+        if (timing === 'generated' && !record.referenceName) {
+            do { record.referenceName = 'voz_' + Array.from(crypto.getRandomValues(new Uint8Array(8)), b => String.fromCharCode(97 + b % 26)).join(''); }
+            while (Array.from(registry.speakers.values()).some(other => other !== record && other.referenceName === record.referenceName));
+        }
+        const name = timing === 'generated' ? record.referenceName! : `mm_${turn.speakerId}`;
+        references.push({ speakerId: turn.speakerId!, name, clip: wrapPCM16(pcm, TARGET_SAMPLE_RATE), durationSec: (to - from) / TARGET_SAMPLE_RATE, sourceTiming: timing,
+            sourceStartSec: audioStartSec + from / TARGET_SAMPLE_RATE, sourceEndSec: audioStartSec + to / TARGET_SAMPLE_RATE, ...quality });
+        captured.add(turn.speakerId!);
     }
     return references;
 };
+
+const updateSpeakerReferences = (registry: SpeakerRegistry, candidates: VoiceReference[]): void => {
+    candidates.forEach(ref => {
+        const record = registry.speakers.get(ref.speakerId);
+        const expectedName = ref.sourceTiming === 'generated' ? record?.referenceName : `mm_${ref.speakerId}`;
+        if (!record || ref.name !== expectedName || !isValidSeconds(ref.durationSec) || ref.durationSec < 2 || ref.durationSec > 10 ||
+            !Number.isFinite(ref.rms) || ref.rms < 0.006 || ref.rms > 1 || !Number.isFinite(ref.activeFraction) || ref.activeFraction < 0.5 || ref.activeFraction > 1 ||
+            ref.clip.size !== 44 + Math.round(ref.durationSec * TARGET_SAMPLE_RATE) * 2) return;
+        if (registry.references.has(ref.speakerId) || !registry.speakers.has(ref.speakerId)) return; // keep the existing validated clip
+        if (registry.references.size >= OPENAI_REFERENCE_CACHE_SIZE) {
+            const oldest = Array.from(registry.references.keys()).sort((a, b) =>
+                registry.speakers.get(a)!.lastSeenChunk - registry.speakers.get(b)!.lastSeenChunk)[0];
+            registry.references.delete(oldest); // scalar name/identity binding survives eviction
+        }
+        registry.references.set(ref.speakerId, ref);
+        registry.referenceBindings.set(ref.name, ref.speakerId);
+    });
+};
+
+const selectSpeakerReferences = (registry: SpeakerRegistry): VoiceReference[] =>
+    Array.from(registry.references.values()).sort((a, b) =>
+        registry.speakers.get(b.speakerId)!.lastSeenChunk - registry.speakers.get(a.speakerId)!.lastSeenChunk ||
+        (a.lastSentChunk ?? -1) - (b.lastSentChunk ?? -1)) // allow newly validated speakers and rotate equally active clips
+        .slice(0, OPENAI_MAX_REFERENCES);
 
 // ==========================================
 // 5. COMPONENTS
@@ -1242,6 +1920,9 @@ interface InputPanelProps {
     onProcessingStart: (msg: string) => void;
     onProcessingComplete: (data: any) => void;
     onError: (msg: string) => void;
+    onProcessingProgress?: (progress: ProcessingProgress) => void;
+    onProvisionalTranscript?: (turns: TurnSegment[], warnings: string[]) => void;
+    disabled?: boolean;
 }
 
 const blobToBase64 = (blob: Blob): Promise<string> => {
@@ -1356,9 +2037,9 @@ const decodeAndChunk = async (
         chunks.push({
             blob: encodeWAVRange(channels, from, to, TARGET_SAMPLE_RATE),
             // Where this blob's audio actually begins — model timestamps are relative to it.
-            audioStartSec: Math.round(from / TARGET_SAMPLE_RATE),
+            audioStartSec: from / TARGET_SAMPLE_RATE,
             // Where this segment's *new* content begins; anything earlier is overlap.
-            contentStartSec: Math.round(start / TARGET_SAMPLE_RATE),
+            contentStartSec: start / TARGET_SAMPLE_RATE,
             durationSec: (to - from) / TARGET_SAMPLE_RATE,
             mimeType: 'audio/wav',
         });
@@ -1366,23 +2047,130 @@ const decodeAndChunk = async (
     return { chunks, duration };
 };
 
-// Drop leading turns that land in the previous segment's territory, in case the
-// model transcribed the overlap anyway despite being told to skip it. If every
-// turn looks early the model's clock is simply off, so keep them all rather than
-// throw away real content.
-const dropOverlapTurns = (turns: TurnSegment[], contentStartSec: number): TurnSegment[] => {
-    let i = 0;
-    while (i < turns.length && turns[i].startSec < contentStartSec - 3) i++;
-    return i >= turns.length ? turns : turns.slice(i);
+const textTokens = (text: string): { value: string, end: number }[] =>
+    Array.from(text.matchAll(/[\p{L}\p{N}]+/gu), m => ({ value: m[0].toLocaleLowerCase(), end: m.index! + m[0].length }));
+
+const sameSpeakerIdentity = (a: TurnSegment, b: TurnSegment): boolean =>
+    a.speakerId || b.speakerId ? Boolean(a.speakerId && a.speakerId === b.speakerId) : a.speaker === b.speaker;
+
+// Evidence is limited to adjacent shared audio. An isolated matching sentence
+// cannot establish continuity: require two distinct, unique, ordered anchors for
+// the same pair, compatible start times, and a one-to-one correspondence.
+const adjacentGeminiSpeakerLinks = (previous: TurnSegment[], current: TurnSegment[], chunk: AudioChunk): Map<string, { speakerId: string, evidence: TurnSegment['speakerIdentityEvidence'] }> => {
+    const links = new Map<string, { speakerId: string, evidence: TurnSegment['speakerIdentityEvidence'] }>();
+    const currentIndex = current[0]?.source?.chunkIndex;
+    if (currentIndex === undefined || chunk.contentStartSec <= chunk.audioStartSec) return links;
+    const inWindow = (t: TurnSegment) => isValidSeconds(t.startSec) && t.startSec >= chunk.audioStartSec &&
+        t.startSec < chunk.contentStartSec && !t.integrityWarnings?.length;
+    const prior = previous.filter(t => t.speakerId && t.source?.chunkIndex === currentIndex - 1 && inWindow(t));
+    const next = current.filter(inWindow);
+    const words = (t: TurnSegment) => textTokens(t.text).map(w => w.value).join(' ');
+    const pairs = new Map<string, { local: string, id: string, anchors: { p: TurnSegment, n: TurnSegment }[] }>();
+    next.forEach(n => {
+        const key = words(n);
+        if (key.length < 40 || textTokens(n.text).length < 6 || next.filter(t => words(t) === key).length !== 1) return;
+        const matches = prior.filter(p => words(p) === key);
+        if (matches.length !== 1 || Math.abs(matches[0].startSec! - n.startSec!) > 2) return;
+        const p = matches[0], local = n.localSpeakerId || n.speaker;
+        const pairKey = JSON.stringify([local, p.speakerId]);
+        const pair = pairs.get(pairKey) || { local, id: p.speakerId!, anchors: [] };
+        pair.anchors.push({ p, n }); pairs.set(pairKey, pair);
+    });
+    const all = Array.from(pairs.values());
+    all.forEach(pair => {
+        if (pair.anchors.length < 2 || all.filter(p => p.local === pair.local).length !== 1 || all.filter(p => p.id === pair.id).length !== 1) return;
+        const ordered = pair.anchors.every((anchor, i) => i === 0 ||
+            anchor.p.source!.interventionIndex > pair.anchors[i - 1].p.source!.interventionIndex);
+        if (!ordered) return;
+        links.set(pair.local, { speakerId: pair.id, evidence: {
+            previousChunkIndex: currentIndex - 1,
+            anchors: pair.anchors.map(({ p, n }) => ({ previousInterventionIndex: p.source!.interventionIndex, currentInterventionIndex: n.source!.interventionIndex })),
+        } });
+    });
+    return links;
+};
+
+// Only a unique, substantial suffix/prefix at adjacent edges is evidence.
+// The character cap bounds the text search to the small shared audio window;
+// it is not a word timestamp or a duration assigned to a turn.
+const adjacentPrefixLength = (previous: string, next: string, maxChars: number, untimed: boolean): number => {
+    const a = textTokens(previous), b = textTokens(next);
+    const minWords = untimed ? 12 : 6, minChars = untimed ? 80 : 40;
+    for (let n = Math.min(a.length, b.length); n >= minWords; n--) {
+        const end = b[n - 1].end;
+        if (end > maxChars || end < minChars || n === b.length) continue; // never erase an entire crossing/untimed turn
+        const suffix = a.slice(-n).map(t => t.value);
+        if (!suffix.every((word, i) => word === b[i].value)) continue;
+        const occurrences = (tokens: { value: string }[]) => {
+            let count = 0;
+            for (let i = 0; i <= tokens.length - n; i++) {
+                if (suffix.every((word, j) => word === tokens[i + j].value)) count++;
+            }
+            return count;
+        };
+        if (occurrences(a) === 1 && occurrences(b) === 1) return end;
+    }
+    return 0;
+};
+
+const reconcileOverlapTurns = (previous: TurnSegment[], turns: TurnSegment[], chunk: AudioChunk): TurnSegment[] => {
+    const from = chunk.audioStartSec, cut = chunk.contentStartSec;
+    if (cut <= from || !previous.length) return turns;
+    const maxChars = Math.ceil((cut - from) * MAX_CHARS_PER_SECOND);
+    const used = new Set<number>();
+    const inSharedWindow = (t: TurnSegment): boolean =>
+        isValidSeconds(t.startSec) && t.startSec < cut && !t.integrityWarnings?.length &&
+        (isValidSeconds(t.endSec) ? t.endSec > from && t.endSec <= cut : t.startSec >= from);
+    const uncertain = (t: TurnSegment): TurnSegment => ({
+        ...t, overlapStatus: 'uncertain',
+        integrityWarnings: [...(t.integrityWarnings || []), 'Empalme incierto: se conservó contenido que podría repetir parte del solapamiento.'],
+    });
+    const result: TurnSegment[] = [];
+    turns.forEach((turn, index) => {
+        if (isValidSeconds(turn.startSec) && turn.startSec >= cut) { result.push(turn); return; }
+        // An entire turn may be removed only with an interval confined to the
+        // overlap AND matching text/speaker in an intersecting previous interval.
+        if (inSharedWindow(turn) && turn.startSec! >= from && isValidSeconds(turn.endSec)) {
+            const words = textTokens(turn.text).map(t => t.value).join(' ');
+            const duplicate = previous.findIndex((p, pi) => !used.has(pi) && inSharedWindow(p) &&
+                isValidSeconds(p.endSec) && p.startSec! <= turn.endSec! && p.endSec >= turn.startSec! &&
+                sameSpeakerIdentity(p, turn) && words.length >= 40 && textTokens(turn.text).length >= 6 &&
+                textTokens(p.text).map(t => t.value).join(' ') === words);
+            if (duplicate >= 0) { used.add(duplicate); return; }
+        }
+        const prior = previous[previous.length - 1];
+        const untimed = turn.source?.timing === 'unavailable' && prior.source?.timing === 'unavailable';
+        // No interval-based dropping for GPT Transcribe. Only its first block's
+        // text edge can be reconciled, with the stronger textual threshold.
+        const timedEdge = isValidSeconds(turn.startSec) && turn.startSec >= from && turn.startSec < cut &&
+            !turn.integrityWarnings?.length && inSharedWindow(prior);
+        if (index === 0 && !used.has(previous.length - 1) && sameSpeakerIdentity(prior, turn) && (untimed || timedEdge)) {
+            const prefixEnd = adjacentPrefixLength(prior.text, turn.text, maxChars, untimed);
+            if (prefixEnd) {
+                result.push({
+                    ...turn, text: turn.text.slice(prefixEnd).replace(/^[\s.,;:!?…—-]+/, ''), overlapStatus: 'prefix-trimmed',
+                });
+                return; // original interval/provenance stays; no made-up word times
+            }
+        }
+        result.push(uncertain(turn));
+    });
+    return result;
 };
 
 // Speaker labels seen so far, carried into the next segment to keep diarization
 // consistent. Timestamps no longer need shifting here: turns come back with
 // absolute seconds already applied.
-const collectSpeakers = (turns: TurnSegment[], into: string[]): void => {
+const collectSpeakers = (turns: TurnSegment[], registry: SpeakerRegistry): GeminiSpeakerContext => {
     turns.forEach(t => {
-        if (t.speaker && t.speaker !== 'Desconocido' && !into.includes(t.speaker)) into.push(t.speaker);
+        const record = t.speakerId ? registry.speakers.get(t.speakerId) : undefined;
+        if (record && t.speakerName && t.speakerNameEvidence) record.name = t.speakerName;
     });
+    const adjacent = Array.from(new Set(turns.slice(-2).map(t => t.speakerId).filter(Boolean)));
+    return {
+        previousLabels: adjacent.map(id => registry.speakers.get(id!)?.label).filter(Boolean) as string[],
+        confirmedNames: adjacent.map(id => registry.speakers.get(id!)?.name).filter(Boolean) as string[],
+    };
 };
 
 // Last couple of turns, handed to the next segment so it knows where to resume.
@@ -1394,7 +2182,7 @@ const tailContext = (turns: TurnSegment[]): string =>
 // so this is about intent, not capability.
 const LIMIT_SECONDS = 180 * 60; // 3 hours
 
-const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessingComplete, onError }) => {
+const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessingComplete, onError, onProcessingProgress, onProvisionalTranscript, disabled = false }) => {
     // Two modals sit between picking a file and uploading it — provider, then
     // session type — so both choices are always made *before* any paid API call
     // happens. `pendingProvider` doubles as the step marker: null means the
@@ -1428,6 +2216,7 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
     };
 
     const startTranscription = (chosenMode: string) => {
+        if (disabled) return;
         const file = pendingFile;
         const chosen = pendingProvider;
         cancelPending();
@@ -1469,6 +2258,11 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
         // survive a page close/reload, per the portable app's current scope.
         let allTurns: TurnSegment[] = [];
         const processingWarnings: string[] = [];
+        let hasMissingAudio = false;
+        const clock = createProcessingClock(onProcessingProgress);
+        let segmentsSucceeded = 0;
+        let segmentsFailed = 0;
+        onProvisionalTranscript?.([], []);
 
         try {
             const apiKey = getGeminiKey();
@@ -1476,8 +2270,10 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
             const displayName = (PROVIDERS[chosen] || PROVIDERS[PROVIDER_GEMINI]).label;
 
             // 1. Decide how (and whether) to split.
+            clock.start('preparation');
             const segments = await prepareSegments(blob);
             if (!segments) { onProcessingComplete(null); return; }
+            clock.setSegments(segments.length, 0, 0);
 
             // Upload one segment to Gemini (File API, with small base64 fallback).
             const uploadSegment = async (segBlob: Blob, segMime: string, label: string): Promise<{ uri?: string, inlineData?: any }> => {
@@ -1493,41 +2289,72 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
 
             // 2. Transcribe each segment, threading speakers and the tail of the
             //    previous segment forward so diarization survives the cuts.
-            const knownSpeakers: string[] = [];
-            let openAIReferences: { name: string, clip: Blob }[] = [];
+            const speakerRegistry = createSpeakerRegistry();
+            let speakerContext: GeminiSpeakerContext = { previousLabels: [], confirmedNames: [] };
             let previousTail = '';
             let previousSegmentSucceeded = false;
+            let previousTurns: TurnSegment[] = [];
 
             for (let i = 0; i < segments.length; i++) {
                 const seg = segments[i];
+                const context: TranscriptChunkContext = {
+                    provider: chosen, chunkIndex: i, audioStartSec: seg.audioStartSec,
+                    contentStartSec: seg.contentStartSec, durationSec: seg.durationSec,
+                };
                 const label = segments.length > 1 ? `Segmento ${i + 1}/${segments.length}` : 'Audio';
+                clock.start('preparation');
+                let sentReferences = chosen === PROVIDER_OPENAI_DIARIZE || chosen === PROVIDER_GEMINI ? selectSpeakerReferences(speakerRegistry) : [];
+                let openAIUploadStarted = false;
+                let openAIUploadCompleted = false;
+                let openAIRequestCompleted = false;
                 try {
                     let turns: TurnSegment[];
 
                     if (isOpenAI(chosen)) {
+                        sentReferences.forEach(ref => { ref.lastSentChunk = i; });
                         onProcessingStart(`${label} · Subiendo a OpenAI`);
-                        turns = await transcribeWithOpenAI(chosen, seg.blob, seg.audioStartSec, (pct) => {
+                        turns = await transcribeWithOpenAI(chosen, seg.blob, context, (pct) => {
                             onProcessingStart(pct < 100 ? `${label} · Subiendo ${pct}%` : `${label} · Transcribiendo (${displayName})`);
-                        }, openAIReferences);
-
-                        // Diarize model only: capture voice references from the first
-                        // segment that yields any, so later segments reuse the same
-                        // speaker labels. gpt-transcribe has no speakers to carry.
-                        if (PROVIDERS[chosen].diarizes && !openAIReferences.length && turns.length && segments.length > 1) {
-                            try {
-                                openAIReferences = await buildSpeakerReferences(seg.blob, turns, seg.audioStartSec);
-                                console.log('[OPENAI] Referencias de voz:', openAIReferences.map(r => r.name));
-                            } catch (refErr) {
-                                console.warn('[OPENAI] No se pudieron construir referencias de voz:', refErr);
+                        }, sentReferences, stage => {
+                            if (stage === 'upload') { openAIUploadStarted = true; clock.start('upload'); }
+                            else if (stage === 'transcription') {
+                                openAIUploadCompleted = true;
+                                clock.start('transcription');
+                                onProcessingStart(`${label} · Transcribiendo (${displayName})`);
+                            } else {
+                                openAIRequestCompleted = true;
+                                if (!openAIUploadCompleted) {
+                                    clock.markCombinedUpload();
+                                    clock.reclassifyCurrentStage('transcription');
+                                }
+                                clock.start('reconciliation');
                             }
-                        }
+                        });
                     } else {
                         onProcessingStart(`${label} · Preparando`);
+                        clock.markUploadReadiness();
+                        clock.start('upload');
                         const source = await uploadSegment(seg.blob, seg.mimeType, label);
+                        if (source.inlineData) clock.markCombinedUpload();
+                        clock.start('preparation');
+                        let voicePreview: Blob | undefined;
+                        if (sentReferences.length) {
+                            try { voicePreview = await buildGeminiVoicePreview(seg.blob); }
+                            catch { console.warn('[TRANSCRIPTION] Vista acústica opcional no disponible; se continúa con el audio principal.'); }
+                        }
+                        if (voicePreview && (typeof source.inlineData?.data === 'string' ? source.inlineData.data.length : 0) + 4 * Math.ceil(voicePreview.size / 3) + 1000 > 19000000) voicePreview = undefined;
+                        const availableReferences = sentReferences;
+                        sentReferences = fitGeminiReferences(source, availableReferences, voicePreview);
+                        if (voicePreview && !sentReferences.length && availableReferences.length) {
+                            voicePreview = undefined;
+                            sentReferences = fitGeminiReferences(source, availableReferences);
+                        }
+                        sentReferences.forEach(ref => { ref.lastSentChunk = i; });
                         onProcessingStart(`${label} · Transcribiendo (${displayName})`);
+                        clock.start('transcription');
 
                         const runSegment = () => transcribeAudioSegment(
-                            ai, source, seg.mimeType, knownSpeakers, previousTail, seg.audioStartSec, chosenMode
+                            ai, source, seg.mimeType, speakerContext, previousTail, context, chosenMode, sentReferences, voicePreview
                         );
 
                         // Retry once if the model fell into a repetition loop: a single
@@ -1540,33 +2367,78 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
                             turns = await runSegment();
                             sane = sanitizeSegmentTurns(turns, seg.durationSec);
                         }
-                        turns = sane || turns.map(t => ({ ...t, text: collapseLoops(t.text) })).filter(t => t.text);
+                        if (!sane) throw new GeminiResponseError('degenerate', 'Gemini repitió una respuesta degenerada después del único reintento.');
+                        turns = sane;
                     }
 
+                    clock.start('reconciliation');
+                    onProcessingStart(`${label} · Reconciliando transcripción`);
                     // An empty provider response has the same operational meaning as
                     // the explicit Gemini no-audio sentinel: skip only this chunk.
                     if (!turns.length) throw new NoAudioDetectedError();
+                    if (chosen === PROVIDER_OPENAI_DIARIZE && !sanitizeSegmentTurns(turns, seg.durationSec)) {
+                        throw new Error('Respuesta de diarización degenerada; no se construyeron referencias de voz.');
+                    }
+                    const hadPriorSpeakers = speakerRegistry.speakers.size > 0;
+                    const overlapLinks = chosen === PROVIDER_GEMINI && previousSegmentSucceeded
+                        ? adjacentGeminiSpeakerLinks(previousTurns, turns, seg) : new Map();
+                    turns = assignSpeakerIdentities(turns, speakerRegistry, sentReferences, overlapLinks);
+                    if (i > 0 && hadPriorSpeakers) {
+                        const pending = Array.from(new Set(turns.filter(t => t.speakerIdentityMethod === 'request-local').map(t => t.speaker)));
+                        if (pending.length) processingWarnings.push(`${label}: continuidad de hablantes pendiente para ${pending.join(', ')}; se conservaron identidades separadas.`);
+                    }
+                    // Refresh from later validated participants too; the bounded
+                    // cache and opaque-name registry are independent of request order.
+                    if ((chosen === PROVIDER_OPENAI_DIARIZE || chosen === PROVIDER_GEMINI) && i < segments.length - 1) {
+                        clock.start('preparation');
+                        try {
+                            const candidates = await buildSpeakerReferences(seg.blob, turns, seg.audioStartSec, speakerRegistry, chosen === PROVIDER_GEMINI ? 'generated' : 'api');
+                            updateSpeakerReferences(speakerRegistry, candidates);
+                            if (chosen === PROVIDER_GEMINI && !speakerRegistry.references.size) {
+                                processingWarnings.push(`${label}: no se obtuvieron muestras acústicas válidas; la continuidad dependerá de evidencia en el solapamiento.`);
+                            }
+                        } catch {
+                            console.warn('[TRANSCRIPTION] No se pudieron extraer muestras válidas; se continúa sin muestras nuevas.');
+                        } finally {
+                            clock.start('reconciliation');
+                        }
+                    }
 
                     // If the immediately preceding chunk failed, keep this chunk's
                     // leading overlap: those seconds are otherwise absent from the
                     // partial transcript. Also do not feed an older tail across a gap.
-                    if (i > 0 && previousSegmentSucceeded) turns = dropOverlapTurns(turns, seg.contentStartSec);
+                    const originalTurns = turns;
+                    if (i > 0 && previousSegmentSucceeded) turns = reconcileOverlapTurns(previousTurns, turns, seg);
+                    turnWarnings(turns).forEach(w => processingWarnings.push(`${label}: ${w}`));
                     allTurns = allTurns.concat(turns);
-                    collectSpeakers(turns, knownSpeakers);
-                    previousTail = tailContext(turns);
+                    speakerContext = collectSpeakers(originalTurns, speakerRegistry);
+                    previousTurns = originalTurns;
+                    previousTail = tailContext(originalTurns);
                     previousSegmentSucceeded = true;
+                    segmentsSucceeded++;
                 } catch (segmentError: any) {
+                    if (isOpenAI(chosen) && openAIUploadStarted && !openAIUploadCompleted && !openAIRequestCompleted) {
+                        clock.markCombinedUpload();
+                        clock.reclassifyCurrentStage('transcription');
+                    }
+                    segmentsFailed++;
+                    hasMissingAudio = true;
                     const noAudio = isNoAudioDetectedError(segmentError);
                     const warning = noAudio
                         ? `${label} omitido: no se detectó audio utilizable.`
                         : `${label} no pudo transcribirse: ${segmentError?.message || 'error desconocido'}`;
                     processingWarnings.push(warning);
                     previousTail = '';
+                    previousTurns = [];
+                    speakerContext = { previousLabels: [], confirmedNames: [] };
                     previousSegmentSucceeded = false;
                     console.warn(`[TRANSCRIPTION] ${warning}`, segmentError);
                     onProcessingStart(`${warning} Continuando con el siguiente segmento…`);
                 }
 
+                clock.pause();
+                clock.setSegments(segments.length, segmentsSucceeded, segmentsFailed);
+                onProvisionalTranscript?.([...allTurns], [...processingWarnings]);
                 if (i < segments.length - 1) await new Promise(r => setTimeout(r, 1200));
             }
 
@@ -1576,6 +2448,7 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
 
             // 3. Put real names on generic labels where the audio justifies it.
             onProcessingStart("Identificando hablantes…");
+            clock.start('names');
             allTurns = await resolveSpeakerNames(ai, allTurns);
 
             // 4. Serialize once — one turn per line — then analyze.
@@ -1586,8 +2459,9 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
                     : `Generando minuta y tareas (${MODEL_DISPLAY_NAME})`
             );
             let analysis: any;
+            clock.start('analysis');
             try {
-                analysis = await analyzeTranscript(ai, fullTranscript, chosenMode, processingWarnings.length > 0);
+                analysis = await analyzeTranscript(ai, fullTranscript, chosenMode, hasMissingAudio);
             } catch (analysisError: any) {
                 // The expensive transcription is still a valid deliverable. Publish
                 // it instead of letting the outer catch discard the checkpoint.
@@ -1596,10 +2470,12 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
                 onProcessingComplete({
                     language: '',
                     transcript_raw: fullTranscript,
+                    transcript_turns: allTurns,
                     minutes: { decisions: [], discussion_points: [], participants: [], full_summary_text: '' },
                     tasks: [],
                     mode: isConference(chosenMode) ? MODE_CONFERENCE : MODE_MEETING,
                     processing_warnings: processingWarnings,
+                    processing_timings: clock.finish(),
                 } as MeetingData);
                 onError(`${warning}. La transcripción obtenida sí fue conservada.`);
                 return;
@@ -1608,7 +2484,9 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
             const fullData: MeetingData = {
                 ...analysis,
                 transcript_raw: fullTranscript,
+                transcript_turns: allTurns,
                 processing_warnings: processingWarnings,
+                processing_timings: clock.finish(),
             };
             onProcessingComplete(fullData);
         } catch (err) {
@@ -1619,10 +2497,12 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
                 onProcessingComplete({
                     language: '',
                     transcript_raw: serializeTranscript(allTurns),
+                    transcript_turns: allTurns,
                     minutes: { decisions: [], discussion_points: [], participants: [], full_summary_text: '' },
                     tasks: [],
                     mode: isConference(chosenMode) ? MODE_CONFERENCE : MODE_MEETING,
                     processing_warnings: processingWarnings,
+                    processing_timings: clock.finish(),
                 } as MeetingData);
                 onError(`${warning}. La transcripción obtenida sí fue conservada.`);
                 return;
@@ -1643,6 +2523,7 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
     };
 
     const startTextAnalysis = (chosenMode: string) => {
+        if (disabled) return;
         const file = pendingTextFile;
         setPendingTextFile(null);
         if (!file) return;
@@ -1654,7 +2535,11 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
             try {
                 const content = ev.target?.result as string;
                 onProcessingStart(`Procesando transcripción (${MODEL_DISPLAY_NAME})…`);
-                const data = await processTextWithGemini(content, chosenMode);
+                const clock = createProcessingClock(onProcessingProgress);
+                clock.start('preparation');
+                const data = /\.json$/i.test(file.name)
+                    ? await processStructuredTranscript(content, chosenMode, clock)
+                    : await processTextWithGemini(content, chosenMode, clock);
                 onProcessingComplete(data);
             } catch (err) {
                 console.error(err);
@@ -1667,7 +2552,7 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
 
     return (
         <>
-            <div className="flex items-center gap-2 bg-slate-900 shadow-inner p-1 rounded-xl border border-white/10">
+            <div className={`flex items-center gap-2 bg-slate-900 shadow-inner p-1 rounded-xl border border-white/10 ${disabled ? 'opacity-40 pointer-events-none' : ''}`}>
                 <label className="flex items-center gap-2 px-4 py-2 hover:bg-slate-800 text-slate-300 rounded-lg cursor-pointer transition-all text-xs font-bold tracking-widest uppercase">
                     <Upload size={14} className="text-executive-emerald" />
                     <span>Cargar Audio</span>
@@ -1676,6 +2561,7 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
                         accept="audio/*,video/*"
                         className="hidden"
                         onChange={handleFileUpload}
+                        disabled={disabled}
                     />
                 </label>
 
@@ -1686,9 +2572,10 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
                     <span>Cargar Transcripción</span>
                     <input
                         type="file"
-                        accept=".txt,.md"
+                        accept=".txt,.md,.json"
                         className="hidden"
                         onChange={handleTextFileUpload}
+                        disabled={disabled}
                     />
                 </label>
             </div>
@@ -1990,22 +2877,125 @@ const SessionTypeModal: React.FC<{
 };
 
 // --- TranscriptView ---
-const TranscriptView: React.FC<{ transcriptRaw: string, minutes: MinuteData, tasks: Task[], mode?: string, processingWarnings?: string[] }> = ({ transcriptRaw, minutes, tasks, mode, processingWarnings = [] }) => {
+const CloseNoticeButton: React.FC<{ onClose: () => void }> = ({ onClose }) => (
+    <button type="button" onClick={onClose} aria-label="Cerrar aviso" title="Cerrar aviso"
+        className="absolute right-2 top-2 rounded-lg p-1 text-slate-400 hover:bg-white/10 hover:text-white">
+        <X size={16} />
+    </button>
+);
+
+const SegmentSpeakerEditor: React.FC<{ turns: TurnSegment[], disabled?: boolean, onEdit: (edit: SpeakerEdit) => void, onVisit: (index: number) => void }> = ({ turns, disabled, onEdit, onVisit }) => {
+    const groups = React.useMemo(() => transcriptSpeakerSegments(turns), [turns]);
+    const speakers = React.useMemo(() => transcriptSpeakers(turns), [turns]);
+    const [fromKey, setFromKey] = React.useState('');
+    const [toKey, setToKey] = React.useState('');
+    const [mapping, setMapping] = React.useState<Record<string, string>>({});
+    const [swapA, setSwapA] = React.useState('');
+    const [swapB, setSwapB] = React.useState('');
+    const from = groups.findIndex(g => g.key === fromKey), to = groups.findIndex(g => g.key === toKey);
+    const selectedGroups = from >= 0 && to >= from ? groups.slice(from, to + 1) : [];
+    const indices = new Set(selectedGroups.flatMap(g => g.turnIndices));
+    const currentSpeakers = transcriptSpeakers(turns.filter((_, index) => indices.has(index)));
+    const edit: Extract<SpeakerEdit, { kind: 'segment-map' }> = { kind: 'segment-map', segmentKeys: selectedGroups.map(g => g.key),
+        mappings: currentSpeakers.map(s => ({ key: s.key, targetKey: mapping[s.key] || s.key })) };
+    const plan = planSegmentSpeakerEdit(turns, edit);
+    const resetMapping = () => { setMapping({}); setSwapA(''); setSwapB(''); };
+    React.useEffect(() => { setMapping({}); setSwapA(''); setSwapB(''); }, [turns]);
+    const selectClass = 'bg-slate-900 border border-white/10 rounded-lg p-2 max-w-full disabled:opacity-30';
+    if (!groups.length) return <p>Esta transcripción no conserva segmentos de origen. Puedes corregir intervenciones o fusionar hablantes.</p>;
+    return <details>
+        <summary className="cursor-pointer text-slate-200">Corregir hablantes por segmento</summary>
+        <p className="my-2">Elige un segmento o un rango y define los reemplazos. Se aplican todos a la vez; A↔B conserva las dos voces. Incluye todas las intervenciones del rango, aunque una búsqueda las oculte.</p>
+        <div className="flex flex-wrap gap-2 mb-3">
+            <label className="flex flex-col gap-1"><span>Desde</span>
+                <select aria-label="Desde segmento" value={fromKey} disabled={disabled} className={selectClass} onChange={e => { setFromKey(e.target.value); setToKey(e.target.value); resetMapping(); }}>
+                    <option value="">Selecciona…</option>{groups.map(g => <option key={g.key} value={g.key}>{g.label}</option>)}
+                </select>
+            </label>
+            <label className="flex flex-col gap-1"><span>Hasta</span>
+                <select aria-label="Hasta segmento" value={toKey} disabled={disabled || from < 0} className={selectClass} onChange={e => { setToKey(e.target.value); resetMapping(); }}>
+                    <option value="">Selecciona…</option>{groups.filter((_, i) => i >= from).map(g => <option key={g.key} value={g.key}>{g.label}</option>)}
+                </select>
+            </label>
+            {selectedGroups.length > 0 && <button className="self-end rounded-lg border border-white/20 px-3 py-2" onClick={() => onVisit(selectedGroups[0].turnIndices[0])}>Ir al inicio</button>}
+        </div>
+        {selectedGroups.length > 0 && <div className="space-y-3">
+            <p>{selectedGroups.length} segmento(s) · {indices.size} intervenciones. El rango indica contenido nuevo; incluye el solapamiento conservado de cada segmento.</p>
+            {currentSpeakers.length > 1 && <div className="flex flex-wrap items-end gap-2">
+                <label className="flex flex-col gap-1"><span>Intercambiar</span>
+                    <select aria-label="Primer hablante a intercambiar" value={swapA} disabled={disabled} className={selectClass} onChange={e => { setSwapA(e.target.value); setSwapB(''); }}>
+                        <option value="">Selecciona…</option>{currentSpeakers.map(s => <option key={s.key} value={s.key}>{s.label}</option>)}
+                    </select>
+                </label>
+                <label className="flex flex-col gap-1"><span>Con</span>
+                    <select aria-label="Segundo hablante a intercambiar" value={swapB} disabled={disabled || !swapA} className={selectClass} onChange={e => setSwapB(e.target.value)}>
+                        <option value="">Selecciona…</option>{currentSpeakers.filter(s => s.key !== swapA).map(s => <option key={s.key} value={s.key}>{s.label}</option>)}
+                    </select>
+                </label>
+                <button disabled={disabled || !swapA || !swapB || swapA === swapB} className="rounded-lg border border-white/20 px-3 py-2 disabled:opacity-30" onClick={() => setMapping(prev => ({ ...prev, [swapA]: swapB, [swapB]: swapA }))}>Preparar intercambio A↔B</button>
+            </div>}
+            <div className="space-y-2">
+                {currentSpeakers.map(s => <label key={s.key} className="grid sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] sm:items-center gap-2">
+                    <span>Actual: {s.label} · {Array.from(indices).filter(i => speakerKey(turns[i]) === s.key).length} intervenciones</span>
+                    <span className="whitespace-nowrap">Reemplazar por:</span>
+                    <select aria-label={`Reemplazar ${s.label} en segmentos`} value={mapping[s.key] || s.key} disabled={disabled} className={selectClass} onChange={e => setMapping(prev => ({ ...prev, [s.key]: e.target.value }))}>
+                        {speakers.map(target => <option key={target.key} value={target.key}>{target.label}{target.key === s.key ? ' (conservar)' : ''}</option>)}
+                    </select>
+                </label>)}
+            </div>
+            <div aria-live="polite" className="rounded-lg bg-white/5 p-3 space-y-1">
+                <p className="text-slate-200">Vista previa: {plan?.size || 0} intervenciones cambiarán.</p>
+                {plan && currentSpeakers.filter(s => edit.mappings.some(m => m.key === s.key && m.targetKey !== s.key)).map(s =>
+                    <p key={s.key}>{s.label} → {speakers.find(target => target.key === mapping[s.key])?.label}</p>)}
+                {plan && selectedGroups.map(g => <p key={g.key}>{g.label}: {g.turnIndices.filter(i => plan.has(i)).length} cambios</p>)}
+            </div>
+            <p>La minuta y las tareas quedarán pendientes de revisión. Puedes deshacer esta operación completa con un clic.</p>
+            <button disabled={disabled || !plan} className="rounded-lg border border-executive-emerald/40 px-3 py-2 text-executive-emerald disabled:opacity-30" onClick={() => { if (plan) { onEdit(edit); resetMapping(); } }}>Aplicar corrección a {plan?.size || 0} intervenciones</button>
+        </div>}
+    </details>;
+};
+
+interface TranscriptViewProps {
+    transcriptRaw: string;
+    transcriptTurns?: TurnSegment[];
+    minutes: MinuteData;
+    tasks: Task[];
+    mode?: string;
+    processingWarnings?: string[];
+    processingTimings?: ProcessingTimings;
+    analysisReview?: MeetingData['analysis_review'];
+    reviewTurn?: { index: number, request: number };
+    onSpeakerEdit: (edit: SpeakerEdit) => void;
+    onUndo: () => void;
+    canUndo: boolean;
+    editingDisabled?: boolean;
+    dismissedNotices: string[];
+    onDismissNotice: (key: string) => void;
+}
+const TranscriptView: React.FC<TranscriptViewProps> = ({ transcriptRaw, transcriptTurns, minutes, tasks, mode, processingWarnings = [], processingTimings, analysisReview, reviewTurn, onSpeakerEdit, onUndo, canUndo, editingDisabled, dismissedNotices, onDismissNotice }) => {
     const [copied, setCopied] = React.useState(false);
     const [searchTerm, setSearchTerm] = React.useState('');
+    const [editingTurn, setEditingTurn] = React.useState<number | null>(null);
+    const [targetKey, setTargetKey] = React.useState('');
+    const [mergeSource, setMergeSource] = React.useState('');
+    const [mergeTarget, setMergeTarget] = React.useState('');
+    const [jumpTurn, setJumpTurn] = React.useState<{ index: number, request: number } | undefined>();
 
     // Uses the shared parser, which scans for turn markers ANYWHERE in the text
     // rather than only at the start of a line. That matters for transcripts
     // produced before normalization existed: the model separated turns with a
     // space, so a line-anchored parser folded dozens of turns into whoever spoke
     // first — which is exactly why one person appeared to say everything.
+    const turns = React.useMemo(() => meetingTurns({ transcript_raw: transcriptRaw, transcript_turns: transcriptTurns }), [transcriptRaw, transcriptTurns]);
+    const speakers = React.useMemo(() => transcriptSpeakers(turns), [turns]);
     const segments = React.useMemo<TranscriptSegment[]>(
-        () => parseTranscriptTurns(transcriptRaw).map(t => ({
+        () => turns.map((t, turnIndex) => ({
             timestamp: fmtTime(t.startSec),
             speaker: t.speaker,
             text: t.text,
+            turnIndex, overlapStatus: t.overlapStatus,
         })),
-        [transcriptRaw]
+        [turns]
     );
 
     // Generic labels worth renaming: "Hablante 2" (what this app emits),
@@ -2019,15 +3009,19 @@ const TranscriptView: React.FC<{ transcriptRaw: string, minutes: MinuteData, tas
     // straight out would re-export the un-separated blob for meetings recorded
     // before normalization existed.
     const exportedTranscript = React.useMemo(
-        () => segments.map(s => `[${s.timestamp}] ${s.speaker}: ${s.text}`).join('\n'),
-        [segments]
+        () => serializeTranscript(turns),
+        [turns]
     );
 
-    const handleRename = (oldName: string) => {
-        const newName = prompt(`Renombrar "${oldName}" a: `, oldName);
-        if (newName && newName !== oldName) {
-            window.dispatchEvent(new CustomEvent('RENAME_SPEAKER', { detail: { oldName, newName } }));
+    const handleRename = (turnIndex: number) => {
+        if (editingDisabled) return;
+        const turn = turns[turnIndex];
+        const newName = prompt(`Renombrar "${turn.speaker}" en toda esta reunión a:`, turn.speakerName || turn.speaker);
+        if (newName?.trim() && !turn.speakerId && speakers.some(s => s.key !== speakerKey(turn) && s.key === `legacy:${newName.trim()}`)) {
+            alert('Ese nombre ya identifica otro hablante antiguo. Usa la fusión explícita para unirlos.');
+            return;
         }
+        if (newName?.trim()) onSpeakerEdit({ kind: 'rename', key: speakerKey(turn), name: newName });
     };
 
     const copyFullTranscript = () => {
@@ -2048,6 +3042,21 @@ const TranscriptView: React.FC<{ transcriptRaw: string, minutes: MinuteData, tas
         URL.revokeObjectURL(url);
     };
 
+    const downloadStructuredTranscript = () => {
+        const content = JSON.stringify({
+            transcript_turns: turns, transcript_raw: exportedTranscript,
+            processing_warnings: processingWarnings, mode: mode || MODE_MEETING,
+            processing_timings: processingTimings,
+            analysis_review: analysisReview,
+        }, null, 2);
+        const url = URL.createObjectURL(new Blob([content], { type: 'application/json;charset=utf-8' }));
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `MeetingMind_Transcript_${new Date().toISOString().slice(0, 10)}.json`;
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    };
+
     // Full minute (acta + tareas + transcripción) as Markdown.
     //
     // `tasks` here is the persistent list, which accumulates across meetings — so
@@ -2055,7 +3064,7 @@ const TranscriptView: React.FC<{ transcriptRaw: string, minutes: MinuteData, tas
     // meetings and have nothing to do with the talk being exported.
     const downloadMinute = () => {
         const conference = isConference(mode || MODE_MEETING);
-        const meeting = { language: '', transcript_raw: exportedTranscript, minutes, tasks: [], mode: (conference ? MODE_CONFERENCE : MODE_MEETING), processing_warnings: processingWarnings } as MeetingData;
+        const meeting = { language: '', transcript_raw: exportedTranscript, transcript_turns: turns, minutes, tasks: [], mode: (conference ? MODE_CONFERENCE : MODE_MEETING), processing_warnings: processingWarnings, processing_timings: processingTimings, analysis_review: analysisReview } as MeetingData;
         const md = buildMeetingMarkdown(meeting, conference ? [] : tasks, mode);
         const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
         const url = URL.createObjectURL(blob);
@@ -2075,6 +3084,16 @@ const TranscriptView: React.FC<{ transcriptRaw: string, minutes: MinuteData, tas
             s.speaker.toLowerCase().includes(searchTerm.toLowerCase())
         );
     }, [segments, searchTerm]);
+
+    React.useEffect(() => {
+        if (reviewTurn) setJumpTurn(reviewTurn);
+    }, [reviewTurn]);
+    React.useEffect(() => {
+        if (!jumpTurn) return;
+        if (searchTerm) { setSearchTerm(''); return; }
+        document.getElementById(`transcript-turn-${jumpTurn.index}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        setJumpTurn(undefined);
+    }, [jumpTurn, searchTerm]);
 
     return (
         <div className="flex flex-col lg:flex-row gap-10 font-sans">
@@ -2102,27 +3121,61 @@ const TranscriptView: React.FC<{ transcriptRaw: string, minutes: MinuteData, tas
                         <div className="flex gap-1.5 p-1 bg-white/5 rounded-xl border border-white/5">
                             <button onClick={copyFullTranscript} className="p-2 text-slate-400 hover:text-white hover:bg-white/5 rounded-lg transition-all" title="Copiar Todo"><Copy size={16} /></button>
                             <button onClick={downloadTranscript} className="p-2 text-slate-400 hover:text-white hover:bg-white/5 rounded-lg transition-all" title="Descargar .TXT"><Download size={16} /></button>
+                            <button onClick={downloadStructuredTranscript} className="p-2 text-slate-400 hover:text-white hover:bg-white/5 rounded-lg transition-all text-xs font-mono" title="Descargar JSON con tiempos precisos y procedencia">JSON</button>
                             <button onClick={downloadMinute} className="p-2 text-slate-400 hover:text-executive-emerald hover:bg-white/5 rounded-lg transition-all" title={`Descargar ${modeCopy(mode).minuteTitle} (.MD)`}><FileText size={16} /></button>
                         </div>
                     </div>
                 </div>
 
-                {hasGenericSpeakers && (
-                    <div className="bg-executive-emerald/5 border border-executive-emerald/20 text-indigo-200/60 px-4 py-3 rounded-2xl mb-8 flex items-center gap-3 text-xs backdrop-blur-md">
+                {hasGenericSpeakers && !dismissedNotices.includes('generic-speakers') && (
+                    <div className="relative bg-executive-emerald/5 border border-executive-emerald/20 text-indigo-200/60 pl-4 pr-10 py-3 rounded-2xl mb-8 flex items-center gap-3 text-xs backdrop-blur-md">
                         <Star size={14} className="text-executive-emerald animate-pulse" />
                         <span>Hay hablantes sin identificar. Haz clic en un nombre para cambiarlo.</span>
+                        <CloseNoticeButton onClose={() => onDismissNotice('generic-speakers')} />
                     </div>
                 )}
 
+                <div className="mb-6 rounded-2xl border border-white/10 p-4 space-y-3 text-xs text-slate-400">
+                    <div className="flex justify-between items-center gap-3">
+                        <p>Corregir hablantes solo modifica esta reunión. El análisis quedará pendiente de revisión.</p>
+                        <button disabled={!canUndo || editingDisabled} onClick={onUndo} className="shrink-0 rounded-lg border border-white/20 px-3 py-2 disabled:opacity-30">Deshacer</button>
+                    </div>
+                    <SegmentSpeakerEditor turns={turns} disabled={editingDisabled} onEdit={onSpeakerEdit} onVisit={index => setJumpTurn({ index, request: Date.now() })} />
+                    {speakers.length > 1 && <details>
+                        <summary className="cursor-pointer text-slate-200">Fusionar hablantes duplicados</summary>
+                        <p className="my-2">Selecciona el hablante actual y por quién reemplazarlo en todas sus intervenciones. Las tareas conservan su asignación hasta revisarlas.</p>
+                        <div className="flex flex-wrap gap-2">
+                            <label className="flex flex-col gap-1"><span>Actual</span>
+                                <select aria-label="Hablante actual" value={mergeSource} onChange={e => setMergeSource(e.target.value)} disabled={editingDisabled} className="bg-slate-900 rounded-lg p-2">
+                                    <option value="">Selecciona…</option>{speakers.map(s => <option key={s.key} value={s.key}>{s.label}</option>)}
+                                </select>
+                            </label>
+                            <label className="flex flex-col gap-1"><span>Reemplazar por:</span>
+                                <select aria-label="Reemplazar por" value={mergeTarget} onChange={e => setMergeTarget(e.target.value)} disabled={editingDisabled} className="bg-slate-900 rounded-lg p-2">
+                                    <option value="">Selecciona…</option>{speakers.filter(s => s.key !== mergeSource).map(s => <option key={s.key} value={s.key}>{s.label}</option>)}
+                                </select>
+                            </label>
+                            <button disabled={editingDisabled || !mergeSource || !mergeTarget || mergeSource === mergeTarget} className="rounded-lg border border-amber-400/30 px-3 py-2 text-amber-200 disabled:opacity-30" onClick={() => {
+                                const source = speakers.find(s => s.key === mergeSource), target = speakers.find(s => s.key === mergeTarget);
+                                if (source && target && confirm(`¿Fusionar todas las intervenciones de "${source.label}" con "${target.label}" en esta reunión?`)) {
+                                    onSpeakerEdit({ kind: 'merge', key: mergeSource, targetKey: mergeTarget });
+                                    setMergeSource(''); setMergeTarget(''); setEditingTurn(null);
+                                }
+                            }}>Fusionar</button>
+                        </div>
+                    </details>}
+                    <p>Deshacer conserva hasta 20 correcciones durante esta sesión; se reinicia al cargar otra reunión o aplicar un análisis.</p>
+                </div>
+
                 <div className="pr-4 space-y-4">
                     {filteredSegments.length > 0 ? filteredSegments.map((segment: any, idx: number) => (
-                        <div key={idx} className="group relative flex gap-6 p-6 rounded-3xl border border-transparent hover:border-white/5 hover:bg-white/[0.02] transition-all duration-500">
+                        <div key={segment.turnIndex} id={`transcript-turn-${segment.turnIndex}`} className={`group relative flex gap-6 p-6 rounded-3xl border ${segment.overlapStatus === 'uncertain' ? 'border-amber-400/20 bg-amber-400/[0.03]' : 'border-transparent hover:border-white/5 hover:bg-white/[0.02]'} transition-all duration-500`}>
                             {/* Accent line for active speaker effect */}
                             <div className="absolute left-0 top-6 bottom-6 w-0.5 bg-executive-emerald opacity-0 group-hover:opacity-40 transition-opacity rounded-full"></div>
 
                             <div className="flex-shrink-0">
                                 <div
-                                    onClick={() => handleRename(segment.speaker)}
+                                    onClick={() => handleRename(segment.turnIndex)}
                                     className="w-12 h-12 rounded-2xl bg-slate-900 border border-white/10 flex items-center justify-center text-slate-500 group-hover:bg-executive-emerald group-hover:text-white group-hover:border-executive-emerald/50 transition-all duration-500 cursor-pointer shadow-2xl relative overflow-hidden"
                                 >
                                     <User size={20} />
@@ -2133,16 +3186,30 @@ const TranscriptView: React.FC<{ transcriptRaw: string, minutes: MinuteData, tas
                             <div className="flex-1 min-w-0">
                                 <div className="flex items-center justify-between mb-2">
                                     <span
-                                        onClick={() => handleRename(segment.speaker)}
+                                        onClick={() => handleRename(segment.turnIndex)}
                                         className="font-bold text-slate-200 text-[15px] hover:text-executive-emerald transition-colors cursor-pointer font-outfit tracking-tighter"
                                     >
                                         {segment.speaker}
                                     </span>
-                                    <span className="text-[10px] text-slate-600 font-mono bg-white/5 px-2 py-0.5 rounded-full border border-white/5">{segment.timestamp}</span>
+                                    <span className="text-[10px] text-slate-500 font-mono bg-white/5 px-2 py-0.5 rounded-full border border-white/5">{turns[segment.turnIndex].source ? `Segmento ${turns[segment.turnIndex].source!.chunkIndex + 1} · ` : ''}{segment.timestamp}</span>
                                 </div>
                                 <p className="text-slate-400 text-[15px] leading-relaxed font-sans selection:bg-executive-emerald/30">
                                     {segment.text}
                                 </p>
+                                {segment.overlapStatus === 'uncertain' && !dismissedNotices.includes(`overlap:${segment.turnIndex}`) && <div className="relative mt-2 rounded-lg bg-amber-400/5 pl-2 pr-9 py-2 text-xs text-amber-200/70">
+                                    Empalme por revisar: se conservó contenido que podría estar repetido.
+                                    <CloseNoticeButton onClose={() => onDismissNotice(`overlap:${segment.turnIndex}`)} />
+                                </div>}
+                                {turns[segment.turnIndex].speakerIdentityMethod === 'manual' && <p className="mt-2 text-xs text-executive-emerald">Atribución corregida manualmente.</p>}
+                                {turns[segment.turnIndex].speakerIdentityMethod !== 'manual' && !!turns[segment.turnIndex].speakerIdentityEvidence?.conflictingSpeakerIds?.length && <p className="mt-2 text-xs text-amber-200">Identidad de voz por revisar: evidencia de continuidad contradictoria.</p>}
+                                <button disabled={editingDisabled} className="mt-2 text-xs text-slate-500 hover:text-white disabled:opacity-30" onClick={() => { setEditingTurn(segment.turnIndex); setTargetKey(''); }}>Reasignar esta intervención</button>
+                                {editingTurn === segment.turnIndex && <div className="mt-2 flex flex-wrap gap-2 text-xs">
+                                    <select aria-label="Asignar intervención a" value={targetKey} onChange={e => setTargetKey(e.target.value)} disabled={editingDisabled} className="bg-slate-900 rounded-lg p-2">
+                                        <option value="">Selecciona el hablante…</option>{speakers.filter(s => s.key !== speakerKey(turns[segment.turnIndex])).map(s => <option key={s.key} value={s.key}>{s.label}</option>)}
+                                    </select>
+                                    <button disabled={editingDisabled || !targetKey} className="rounded-lg border border-white/20 px-3 py-2 disabled:opacity-30" onClick={() => { onSpeakerEdit({ kind: 'reassign', turnIndex: segment.turnIndex, targetKey }); setEditingTurn(null); }}>Aplicar</button>
+                                    <button className="px-2" onClick={() => setEditingTurn(null)}>Cerrar</button>
+                                </div>}
                             </div>
                         </div>
                     )) : segments.length === 0 ? (
@@ -2813,10 +3880,19 @@ const buildMeetingMarkdown = (meeting: MeetingData, tasks: Task[], mode: string 
     const lines: string[] = [`# ${conference ? 'Relatoría de Conferencia' : 'Minuta de Reunión'} — ${date}`, ''];
 
     if (meeting?.language) lines.push(`*Idioma: ${meeting.language}*`, '');
+    if (meeting.analysis_review?.minutes || meeting.analysis_review?.tasks) {
+        lines.push('> **Análisis pendiente de revisión tras corregir hablantes.**',
+            `> ${meeting.analysis_review.minutes ? 'Minuta/relatoría pendiente. ' : ''}${meeting.analysis_review.tasks ? 'Tareas pendientes; se conservan las existentes.' : ''}`, '');
+    }
     if (meeting?.processing_warnings?.length) {
-        lines.push('> **Advertencia: resultado parcial.**');
+        lines.push(`> **${processingNotice(meeting).title}.**`);
         meeting.processing_warnings.forEach(w => lines.push(`> - ${w}`));
         lines.push('');
+    }
+    if (meeting.processing_timings) {
+        lines.push('## Tiempos medidos', `- Total: ${formatElapsed(meeting.processing_timings.totalMs)}`);
+        processingTimingRows(meeting.processing_timings).forEach(row => lines.push(`- ${row.label}: ${formatElapsed(row.ms)}`));
+        lines.push('', processingTimingNotes(meeting.processing_timings), '');
     }
     if (m.participants?.length) lines.push(`## ${copy.participants.title}`, ...m.participants.map((p: string) => `- ${p}`), '');
     if (m.full_summary_text) lines.push(`## ${conference ? 'Relatoría' : 'Acta'}`, m.full_summary_text, '');
@@ -2837,40 +3913,232 @@ const buildMeetingMarkdown = (meeting: MeetingData, tasks: Task[], mode: string 
     return lines.join('\n');
 };
 
-function App() {
-    const migrateMeetingData = (data: any): MeetingData => {
-        if (!data) return EMPTY_MEETING;
-
-        // Auto-Migration for Legacy Data (Array -> String)
-        if (Array.isArray(data.transcript) && !data.transcript_raw) {
-            data.transcript_raw = data.transcript
-                .map((t: any) => `[${t.timestamp || '00:00'}] ${t.speaker || 'Unknown'}: ${t.text || ''} `)
-                .join('\n');
-            delete data.transcript;
+const migrateMeetingData = (stored: any): MeetingData => {
+    if (!stored) return EMPTY_MEETING;
+    const data = { ...stored };
+    const warnings = Array.isArray(data.processing_warnings)
+        ? data.processing_warnings.filter((w: any) => typeof w === 'string' && w) : [];
+    data.minutes = data.minutes || EMPTY_MEETING.minutes;
+    data.minutes = repairHumanText(data.minutes);
+    data.tasks = Array.isArray(data.tasks) ? data.tasks.map(migrateTask) : [];
+    data.mode = data.mode === MODE_CONFERENCE ? MODE_CONFERENCE : MODE_MEETING;
+    data.processing_timings = readProcessingTimings(data.processing_timings);
+    data.analysis_review = data.analysis_review && typeof data.analysis_review === 'object'
+        ? { minutes: data.analysis_review.minutes === true, tasks: data.analysis_review.tasks === true } : undefined;
+    data.transcript_raw = typeof data.transcript_raw === 'string' ? data.transcript_raw : '';
+    if (data.transcript_turns != null) {
+        try {
+            const turns = readStoredTurns(data.transcript_turns);
+            if (!turns.length && data.transcript_raw.trim()) throw new Error('Empty structured projection with available raw text.');
+            data.processing_warnings = Array.from(new Set([...warnings, ...turnWarnings(turns)]));
+            return withTranscript(data, turns);
+        } catch {
+            // Do not strand an older usable raw transcript behind invalid metadata.
+            warnings.push('Turnos estructurados inválidos; se recuperó la transcripción compatible.');
+            delete data.transcript_turns;
         }
+    }
+    if (Array.isArray(data.transcript) && !data.transcript_raw) {
+        const turns = data.transcript.map((t: any) => {
+            const time = parseTimeToSeconds(String(t?.timestamp || ''));
+            return withRepairedTurnText({ startSec: time >= 0 ? time : undefined, speaker: t?.speaker || 'Unknown', text: '' }, t?.text || '');
+        });
+        delete data.transcript;
+        Object.assign(data, withTranscript(data, turns));
+    }
+    const repairedRaw = repairEscapedUtf8(data.transcript_raw);
+    if (repairedRaw !== data.transcript_raw) {
+        data.transcript_encoding_original = data.transcript_encoding_original || data.transcript_raw;
+        Object.assign(data, withTranscript(data, parseTranscriptTurns(data.transcript_raw)));
+    }
+    data.processing_warnings = warnings;
+    return data as MeetingData;
+};
 
-        // Fallback for missing raw field
-        if (!data.transcript_raw) data.transcript_raw = '';
+const renameTranscriptSpeaker = (meeting: MeetingData, oldName: string, newName: string): MeetingData =>
+    withTranscript(meeting, meetingTurns(meeting).map(t => {
+        if (t.speaker !== oldName) return t;
+        return t.speakerId ? {
+            ...t, speaker: `${newName.trim()} (${genericSpeakerLabel(t)})`, speakerName: newName.trim(), speakerNameEvidence: { kind: 'manual' },
+        } : { ...t, speaker: newName };
+    }));
 
-        // Ensure sub-objects exist
-        if (!data.minutes) data.minutes = EMPTY_MEETING.minutes;
-        data.tasks = Array.isArray(data.tasks) ? data.tasks.map(migrateTask) : [];
-        data.processing_warnings = Array.isArray(data.processing_warnings)
-            ? data.processing_warnings.map((w: any) => String(w)).filter(Boolean)
-            : [];
+type SpeakerEdit = { kind: 'rename', key: string, name: string }
+    | { kind: 'reassign', turnIndex: number, targetKey: string }
+    | { kind: 'merge', key: string, targetKey: string }
+    | { kind: 'segment-map', segmentKeys: string[], mappings: { key: string, targetKey: string }[] };
+interface SpeakerUndo {
+    meeting: MeetingData;
+    taskChanges: { id: string, before: Task, after: Task }[];
+}
+const transcriptSpeakers = (turns: TurnSegment[]): { key: string, label: string, turn: TurnSegment }[] =>
+    Array.from(new Map(turns.map(t => [speakerKey(t), { key: speakerKey(t), label: t.speaker, turn: t }])).values());
 
-        // Records saved before conference mode existed carry no `mode`; they are
-        // all meetings, and anything unrecognized falls back to the same.
-        data.mode = data.mode === MODE_CONFERENCE ? MODE_CONFERENCE : MODE_MEETING;
+// Group only by persisted request provenance; a missing turn time does not lose
+// its segment, and legacy text is never assigned an invented ten-minute chunk.
+const speakerSegmentKey = (turn: TurnSegment): string | undefined => {
+    const s = turn.source;
+    if (!s || typeof s.provider !== 'string' || !Number.isInteger(s.chunkIndex) || s.chunkIndex < 0 ||
+        ![s.audioStartSec, s.contentStartSec, s.durationSec].every(isValidSeconds)) return undefined;
+    return JSON.stringify([s.provider, s.chunkIndex, s.audioStartSec, s.contentStartSec, s.durationSec]);
+};
+const transcriptSpeakerSegments = (turns: TurnSegment[]) => {
+    const groups = new Map<string, { key: string, label: string, turnIndices: number[] }>();
+    turns.forEach((t, index) => {
+        const key = speakerSegmentKey(t);
+        if (!key) return;
+        const s = t.source!;
+        const group = groups.get(key) || { key,
+            label: `Segmento ${s.chunkIndex + 1} · ${fmtTime(s.contentStartSec)}–${fmtTime(s.audioStartSec + s.durationSec)}`,
+            turnIndices: [] };
+        group.turnIndices.push(index); groups.set(key, group);
+    });
+    return Array.from(groups.values());
+};
+const planSegmentSpeakerEdit = (turns: TurnSegment[], edit: Extract<SpeakerEdit, { kind: 'segment-map' }>): Map<number, TurnSegment> | null => {
+    const groups = transcriptSpeakerSegments(turns);
+    if (!edit.segmentKeys.length || !edit.mappings.length || edit.segmentKeys.some(key => !groups.some(g => g.key === key))) return null;
+    const selected = new Set(edit.segmentKeys);
+    const targets = new Map(transcriptSpeakers(turns).map(s => [s.key, s.turn]));
+    const mapping = new Map<string, TurnSegment>();
+    for (const m of edit.mappings) {
+        if (mapping.has(m.key) || !targets.has(m.targetKey) || !turns.some(t => selected.has(speakerSegmentKey(t)!) && speakerKey(t) === m.key)) return null;
+        mapping.set(m.key, targets.get(m.targetKey)!);
+    }
+    const replacements = new Map<number, TurnSegment>();
+    turns.forEach((t, index) => {
+        const target = selected.has(speakerSegmentKey(t)!) ? mapping.get(speakerKey(t)) : undefined;
+        if (target && speakerKey(target) !== speakerKey(t)) replacements.set(index, target);
+    });
+    return replacements.size ? replacements : null;
+};
+const manuallyAssignSpeaker = (t: TurnSegment, target: TurnSegment, kind: 'reassign' | 'merge' | 'segment-map'): TurnSegment => {
+    const { speaker, speakerId, speakerName, speakerIdentityMethod, speakerIdentityEvidence, speakerNameEvidence } = t;
+    return { ...t, speaker: target.speaker, speakerId: target.speakerId, speakerName: target.speakerName,
+        speakerNameEvidence: target.speakerNameEvidence, speakerIdentityMethod: 'manual', speakerIdentityEvidence: undefined,
+        speakerCorrections: [...(t.speakerCorrections || []), {
+            kind, previous: { speaker, speakerId, speakerName, speakerIdentityMethod, speakerIdentityEvidence, speakerNameEvidence },
+        }] };
+};
 
-        return data as MeetingData;
+// Explicit edits only. Local provider labels, times, speech and sources stay intact.
+const applySpeakerEdit = (meeting: MeetingData, tasks: Task[], edit: SpeakerEdit):
+    { meeting: MeetingData, tasks: Task[], undo: SpeakerUndo } | null => {
+    const turns = meetingTurns(meeting);
+    if (edit.kind === 'segment-map') {
+        const replacements = planSegmentSpeakerEdit(turns, edit);
+        if (!replacements) return null;
+        // Read all replacements from the original snapshot: A↔B is one atomic
+        // mapping, never two fusions that would collapse both voices into one.
+        const updated = turns.map((t, index) => replacements.has(index) ? manuallyAssignSpeaker(t, replacements.get(index)!, edit.kind) : t);
+        return { meeting: { ...withTranscript(meeting, updated), analysis_review: { minutes: true, tasks: !isConference(meeting.mode) } },
+            tasks, undo: { meeting, taskChanges: [] } };
+    }
+    const source = edit.kind === 'reassign' ? turns[edit.turnIndex] : turns.find(t => speakerKey(t) === edit.key);
+    if (!source || (edit.kind === 'rename' && !edit.name.trim())) return null;
+    const target = edit.kind === 'rename' ? undefined : turns.find(t => speakerKey(t) === edit.targetKey);
+    if (edit.kind !== 'rename' && (!target || speakerKey(source) === speakerKey(target))) return null;
+    const name = edit.kind === 'rename' ? edit.name.trim() : '';
+    if (edit.kind === 'rename' && (source.speakerName || source.speaker) === name) return null;
+    if (edit.kind === 'rename' && !source.speakerId && turns.some(t => speakerKey(t) !== speakerKey(source) && speakerKey(t) === `legacy:${name}`)) return null;
+    const updated = turns.map((t, index) => {
+        const matches = edit.kind === 'reassign' ? index === edit.turnIndex : speakerKey(t) === speakerKey(source);
+        if (!matches) return t;
+        if (edit.kind === 'rename') return t.speakerId
+            ? { ...t, speaker: `${name} (${genericSpeakerLabel(t)})`, speakerName: name, speakerNameEvidence: { kind: 'manual' as const } }
+            : { ...t, speaker: name };
+        return manuallyAssignSpeaker(t, target!, edit.kind);
+    });
+    let next = withTranscript(meeting, updated);
+    const taskChanges: SpeakerUndo['taskChanges'] = [];
+    let nextTasks = tasks;
+    if (edit.kind === 'rename') {
+        // The existing rename scope is retained; reassignment/fusion never guesses task ownership.
+        const uniqueName = source.speakerName && !turns.some(t => speakerKey(t) !== speakerKey(source) && t.speakerName === source.speakerName);
+        const oldLabels = new Set([source.speaker, uniqueName ? source.speakerName : undefined].filter(Boolean));
+        const ownedIds = new Set(meeting.tasks.filter(t => t.id && oldLabels.has(t.assignee)).map(t => t.id));
+        const renameTask = (t: Task): Task => ({ ...t, assignee: name, is_owner: assigneeIsOwner(name) });
+        next = { ...next,
+            minutes: { ...meeting.minutes, participants: (meeting.minutes.participants || []).map(p => oldLabels.has(p) ? name : p) },
+            tasks: meeting.tasks.map(t => oldLabels.has(t.assignee) ? renameTask(t) : t),
+        };
+        nextTasks = tasks.map(t => {
+            if (!ownedIds.has(t.id) || !oldLabels.has(t.assignee)) return t;
+            const after = renameTask(t);
+            taskChanges.push({ id: t.id, before: t, after });
+            return after;
+        });
+    }
+    return { meeting: { ...next, analysis_review: { minutes: true, tasks: !isConference(meeting.mode) } }, tasks: nextTasks,
+        undo: { meeting, taskChanges } };
+};
+
+// Restore only rename fields still matching our change; keep later manual edits/status.
+const undoSpeakerTasks = (tasks: Task[], undo: SpeakerUndo): Task[] => tasks.map(t => {
+    const change = undo.taskChanges.find(c => c.id === t.id);
+    if (!change || t.assignee !== change.after.assignee) return t;
+    return { ...t, assignee: change.before.assignee,
+        is_owner: t.is_owner === change.after.is_owner ? change.before.is_owner : t.is_owner };
+});
+
+const taskDescriptionKey = (description: string): string => description.normalize('NFKC').toLocaleLowerCase()
+    .replace(/[\p{P}\p{S}]/gu, ' ').replace(/\s+/g, ' ').trim();
+const newAnalysisTaskProposals = (proposals: Task[], existing: Task[]): Task[] => {
+    const seen = new Set(existing.filter(t => typeof t.description === 'string').map(t => taskDescriptionKey(t.description)));
+    return proposals.filter(t => typeof t?.description === 'string' && t.description.trim()).flatMap(t => {
+        const key = taskDescriptionKey(t.description);
+        if (seen.has(key)) return [];
+        seen.add(key);
+        // Never trust/reuse model task IDs or overwrite an accumulated task.
+        return [{ ...migrateTask(t), id: crypto.randomUUID(), completed: false }];
+    });
+};
+
+const transcriptHasMissingAudio = (meeting: MeetingData): boolean =>
+    (meeting.processing_warnings || []).some(w => /no pudo transcribirse|omitido:|proceso se interrumpió/i.test(w));
+
+const applyRegeneratedAnalysis = (meeting: MeetingData, tasks: Task[], analysis: any, selected: Task[]): { meeting: MeetingData, tasks: Task[] } => {
+    const added = isConference(meeting.mode) ? [] : newAnalysisTaskProposals(selected, [...tasks, ...meeting.tasks]);
+    return {
+        meeting: { ...meeting, language: analysis.language || meeting.language, minutes: analysis.minutes,
+            tasks: [...meeting.tasks, ...added], analysis_review: { minutes: false, tasks: !isConference(meeting.mode) },
+            processing_warnings: (meeting.processing_warnings || []).map(w => /^No se pudo generar /i.test(w) ? `Análisis anterior: ${w}` : w),
+        },
+        tasks: [...tasks, ...added],
     };
+};
+
+function App() {
 
     const [activeTab, setActiveTab] = useState<Tab>(Tab.TASKS);
     const [meetingData, setMeetingData] = useState<MeetingData>(EMPTY_MEETING);
     const [persistentTasks, setPersistentTasks] = useState<Task[]>([]);
     const [isLoading, setIsLoading] = useState(false);
     const [loadingMessage, setLoadingMessage] = useState("Procesando la reunión…");
+    const [processingProgress, setProcessingProgress] = useState<ProcessingProgress | null>(null);
+    const [processingNow, setProcessingNow] = useState(0);
+    const [reviewTurn, setReviewTurn] = useState<{ index: number, request: number } | undefined>();
+    const [speakerHistory, setSpeakerHistory] = useState<SpeakerUndo[]>([]);
+    const [dismissedNotices, setDismissedNotices] = useState<string[]>([]);
+    const dismissNotice = (key: string) => setDismissedNotices(prev => prev.includes(key) ? prev : [...prev, key]);
+    const processingNoticeKey = `processing:${JSON.stringify(meetingData.processing_warnings || [])}`;
+    const analysisNoticeKey = `analysis-review:${JSON.stringify(meetingData.analysis_review)}`;
+    const [provisional, setProvisional] = useState<{ turns: TurnSegment[], warnings: string[] } | null>(null);
+    const [isRegenerating, setIsRegenerating] = useState(false);
+    const [analysisDraft, setAnalysisDraft] = useState<{ base: MeetingData, analysis: any, proposals: Task[], elapsedMs: number } | null>(null);
+    const [selectedProposals, setSelectedProposals] = useState<string[]>([]);
+    const analysisRequest = useRef(0);
+    const meetingRef = useRef(meetingData);
+    const tasksRef = useRef(persistentTasks);
+    meetingRef.current = meetingData;
+    tasksRef.current = persistentTasks;
+    const notice = React.useMemo(() => processingNotice(meetingData), [meetingData]);
+    useEffect(() => {
+        if (!isLoading) return;
+        setProcessingNow(performance.now());
+        const timer = window.setInterval(() => setProcessingNow(performance.now()), 1000);
+        return () => window.clearInterval(timer);
+    }, [isLoading]);
     const [isManualTaskModalOpen, setIsManualTaskModalOpen] = useState(false);
     const [isInitialLoad, setIsInitialLoad] = useState(true);
     const [config, setConfig] = useState<AppConfig>(() => getConfig());
@@ -2948,52 +4216,72 @@ function App() {
         return () => window.removeEventListener('IMPORT_TASKS', handleImport);
     }, []);
 
-    // Handle Rename Speaker Event
-    useEffect(() => {
-        const handleRename = (e: any) => {
-            const { oldName, newName } = e.detail;
-            if (!oldName || !newName) return;
+    const invalidateAnalysisDraft = () => {
+        analysisRequest.current++;
+        setIsRegenerating(false);
+        setAnalysisDraft(null);
+        setSelectedProposals([]);
+    };
 
-            // Update Meeting Data (Transcript & Minutes)
-            setMeetingData(prev => {
-                // Safely handle potential undefined/null
-                const currentRaw = prev.transcript_raw || '';
+    const editSpeaker = (edit: SpeakerEdit) => {
+        if (isLoading || isRegenerating) return;
+        const result = applySpeakerEdit(meetingRef.current, tasksRef.current, edit);
+        if (!result) return;
+        setDismissedNotices(prev => prev.filter(k => !k.startsWith('analysis-review:')));
+        invalidateAnalysisDraft();
+        setSpeakerHistory(prev => [...prev.slice(-19), result.undo]);
+        meetingRef.current = result.meeting; tasksRef.current = result.tasks;
+        setMeetingData(result.meeting); setPersistentTasks(result.tasks);
+    };
 
-                // Rename the speaker in the raw transcript. The timestamp bracket
-                // is optional: turns parsed without one ("Name: text") must be
-                // renamed too, otherwise they silently keep the old label.
-                const escapedOldName = oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-                const regex = new RegExp(`(^|\\]\\s*|\\n)${escapedOldName}:\\s`, 'g');
-                const nextRaw = currentRaw.replace(regex, (_m, prefix) => `${prefix}${newName}: `);
+    const undoSpeaker = () => {
+        if (isLoading || isRegenerating) return;
+        const undo = speakerHistory[speakerHistory.length - 1];
+        if (!undo) return;
+        invalidateAnalysisDraft();
+        const tasks = undoSpeakerTasks(tasksRef.current, undo);
+        meetingRef.current = undo.meeting; tasksRef.current = tasks;
+        setMeetingData(undo.meeting); setPersistentTasks(tasks);
+        setSpeakerHistory(prev => prev.slice(0, -1));
+    };
 
-                return {
-                    ...prev,
-                    transcript_raw: nextRaw,
-                    minutes: {
-                        ...prev.minutes,
-                        participants: (prev.minutes.participants || []).map(p => p === oldName ? newName : p),
-                    },
-                    tasks: (prev.tasks || []).map(t => ({
-                        ...t,
-                        assignee: t.assignee === oldName ? newName : t.assignee
-                    }))
-                };
-            });
+    const regenerateAnalysis = async () => {
+        if (isLoading || isRegenerating || !meetingRef.current.transcript_raw.trim()) return;
+        const base = meetingRef.current;
+        const request = ++analysisRequest.current;
+        const startedAt = performance.now();
+        setAnalysisDraft(null); setSelectedProposals([]); setIsRegenerating(true);
+        try {
+            const analysis = await analyzeTranscript(new GenAI({ apiKey: getGeminiKey() }), base.transcript_raw, base.mode, transcriptHasMissingAudio(base));
+            if (analysisRequest.current !== request || meetingRef.current !== base) return;
+            if (!analysis?.minutes || typeof analysis.minutes.full_summary_text !== 'string' ||
+                !['participants', 'decisions', 'discussion_points'].every(k => Array.isArray(analysis.minutes[k]) && analysis.minutes[k].every(v => typeof v === 'string'))) {
+                throw new Error('El análisis recibido no contiene una minuta/relatoría válida.');
+            }
+            const proposals = newAnalysisTaskProposals(analysis.tasks || [], [...tasksRef.current, ...base.tasks]);
+            setAnalysisDraft({ base, analysis, proposals, elapsedMs: performance.now() - startedAt });
+        } catch (error: any) {
+            if (analysisRequest.current === request && meetingRef.current === base) alert(`No se pudo regenerar el análisis: ${error?.message || 'error desconocido'}. Se conservaron la minuta y las tareas anteriores.`);
+        } finally {
+            if (analysisRequest.current === request) setIsRegenerating(false);
+        }
+    };
 
-            // Update Persistent Tasks
-            setPersistentTasks(prev => prev.map(t => ({
-                ...t,
-                assignee: t.assignee === oldName ? newName : t.assignee
-            })));
-        };
-
-        window.addEventListener('RENAME_SPEAKER', handleRename);
-        return () => window.removeEventListener('RENAME_SPEAKER', handleRename);
-    }, []);
+    const applyAnalysisDraft = () => {
+        if (!analysisDraft || meetingRef.current !== analysisDraft.base) return;
+        // Recheck against the latest task list (imports/manual edits may have happened during review).
+        const result = applyRegeneratedAnalysis(meetingRef.current, tasksRef.current, analysisDraft.analysis,
+            analysisDraft.proposals.filter(t => selectedProposals.includes(t.id)));
+        meetingRef.current = result.meeting; tasksRef.current = result.tasks;
+        setMeetingData(result.meeting); setPersistentTasks(result.tasks); setSpeakerHistory([]);
+        invalidateAnalysisDraft();
+    };
 
     // Handle Clean Tasks Event
     useEffect(() => {
         const handleClean = () => {
+            setSpeakerHistory([]);
+            invalidateAnalysisDraft();
             setPersistentTasks(prev => prev.filter(t => !t.completed));
             setMeetingData(prev => ({
                 ...prev,
@@ -3031,14 +4319,21 @@ function App() {
     };
 
     const handleProcessingComplete = (newData: MeetingData) => {
+        setIsLoading(false);
+        setProcessingProgress(null);
+        setReviewTurn(undefined);
+        setProvisional(null);
         if (!newData) return;
+        setDismissedNotices([]);
+        invalidateAnalysisDraft();
+        setSpeakerHistory([]);
+        meetingRef.current = newData;
         setMeetingData(newData);
         setPersistentTasks(prev => {
             const existingIds = new Set(prev.map(t => t.id));
             const tasksToAdd = (newData.tasks || []).filter(t => !existingIds.has(t.id));
             return [...prev, ...tasksToAdd];
         });
-        setIsLoading(false);
         // A conference produces no tasks, so landing on the Tasks tab would drop
         // the user on a screen with nothing new on it. Its result is the minute.
         setActiveTab(isConference(newData.mode) ? Tab.MINUTES : Tab.TASKS);
@@ -3048,6 +4343,9 @@ function App() {
         if (confirm("Se borrarán todas las tareas y la reunión cargada. ¿Continuar?")) {
             setPersistentTasks([]);
             setMeetingData(EMPTY_MEETING);
+            meetingRef.current = EMPTY_MEETING; tasksRef.current = [];
+            setSpeakerHistory([]); setProvisional(null); invalidateAnalysisDraft();
+            setDismissedNotices([]);
             localStorage.removeItem(STORAGE_KEY_TASKS);
             localStorage.removeItem(STORAGE_KEY_MEETING);
         }
@@ -3093,6 +4391,9 @@ function App() {
                         <InputPanel
                             onProcessingStart={handleProcessingStart}
                             onProcessingComplete={handleProcessingComplete}
+                            onProcessingProgress={setProcessingProgress}
+                            onProvisionalTranscript={(turns, warnings) => setProvisional({ turns, warnings })}
+                            disabled={isLoading || isRegenerating}
                             onError={(err) => { setIsLoading(false); alert(err); }}
                         />
                         <button
@@ -3104,6 +4405,7 @@ function App() {
                         </button>
                         <button
                             onClick={clearDatabase}
+                            disabled={isLoading}
                             className="p-2 text-slate-500 hover:text-red-400 transition-colors rounded-lg hover:bg-slate-800"
                             title="Borrar todos los datos"
                         >
@@ -3133,9 +4435,24 @@ function App() {
                                 <ShieldCheck className="text-executive-emerald/40 animate-pulse" size={40} />
                             </div>
                         </div>
+                        {provisional && provisional.turns.length > 0 && <details className="w-full max-w-4xl rounded-2xl border border-amber-400/20 bg-white/[0.02] p-5 text-sm text-slate-300">
+                            <summary className="cursor-pointer font-bold text-amber-200">Transcripción provisional · {provisional.turns.length} intervenciones disponibles</summary>
+                            <p className="my-3 text-xs text-slate-400">Puede faltar audio y cambiar la identificación de hablantes. Esta vista no se guarda automáticamente; el resultado se guarda al terminar.</p>
+                            {provisional.warnings.length > 0 && !dismissedNotices.includes(`provisional:${JSON.stringify(provisional.warnings)}`) && <div className="relative mb-3 pr-9 text-xs text-amber-200/70">
+                                <ul>{provisional.warnings.map((w, i) => <li key={i}>{w}</li>)}</ul>
+                                <CloseNoticeButton onClose={() => dismissNotice(`provisional:${JSON.stringify(provisional.warnings)}`)} />
+                            </div>}
+                            <div className="max-h-80 overflow-auto space-y-3">{provisional.turns.map((t, i) => <p key={i}><span className="text-executive-emerald">[{fmtTime(t.startSec)}] {t.speaker}: </span>{t.text}</p>)}</div>
+                        </details>}
                         <div className="text-center animate-in fade-in zoom-in duration-700">
                             <h2 className="text-2xl font-bold text-white tracking-tight font-outfit">{loadingMessage}</h2>
                             <p className="text-slate-500 mt-2 font-mono text-xs tracking-[0.2em]">Puede tardar varios minutos. No cierres esta ventana.</p>
+                            {processingProgress && <div className="mt-4 space-y-2 text-sm text-slate-400">
+                                <p>Transcurrido: <span className="font-mono text-slate-200">{formatElapsed(processingNow - processingProgress.startedAt)}</span></p>
+                                {processingProgress.currentStage && processingProgress.stageStartedAt !== undefined && <p>{PROCESSING_STAGE_LABELS[processingProgress.currentStage]}: {formatElapsed(processingNow - processingProgress.stageStartedAt)}</p>}
+                                {processingProgress.segmentsTotal > 0 && <p>{processingProgress.segmentsSucceeded + processingProgress.segmentsFailed}/{processingProgress.segmentsTotal} fragmentos procesados · {processingProgress.segmentsSucceeded} correctos{processingProgress.segmentsFailed > 0 ? ` · ${processingProgress.segmentsFailed} fallidos u omitidos` : ''}</p>}
+                                <p className="text-xs text-slate-500">Tiempo transcurrido y fragmentos terminados; no es una estimación de inferencia.</p>
+                            </div>}
                         </div>
                     </div>
                 ) : (
@@ -3161,17 +4478,62 @@ function App() {
                         </div>
 
                         <div className="animate-in fade-in slide-in-from-bottom-2 duration-500">
-                            {(meetingData.processing_warnings || []).length > 0 && (
-                                <div className="mb-8 flex items-start gap-3 rounded-2xl border border-amber-400/20 bg-amber-400/[0.07] px-5 py-4 text-amber-100/80">
+                            {dismissedNotices.length > 0 && <button className="mb-4 text-xs text-slate-400 hover:text-white" onClick={() => setDismissedNotices([])}>Mostrar avisos ocultos</button>}
+                            {(meetingData.processing_warnings || []).length > 0 && !dismissedNotices.includes(processingNoticeKey) && (
+                                <div className="relative mb-8 flex items-start gap-3 rounded-2xl border border-amber-400/20 bg-amber-400/[0.07] pl-5 pr-12 py-4 text-amber-100/80">
+                                    <CloseNoticeButton onClose={() => dismissNotice(processingNoticeKey)} />
                                     <AlertTriangle size={18} className="mt-0.5 shrink-0 text-amber-400" />
                                     <div>
-                                        <p className="text-sm font-bold text-amber-200">Resultado parcial</p>
-                                        <ul className="mt-1 space-y-1 text-xs leading-relaxed">
-                                            {(meetingData.processing_warnings || []).map((warning, index) => <li key={index}>{warning}</li>)}
-                                        </ul>
+                                        <p className="text-sm font-bold text-amber-200">{notice.title}</p>
+                                        {notice.overlapWarnings.length > 0 && <>
+                                            <p className="mt-1 text-xs leading-relaxed">Se conservó contenido en los límites de fragmentos para evitar perder información. Revisa posibles repeticiones.</p>
+                                            <div className="mt-2 flex flex-wrap gap-2">
+                                                {notice.chunks.map(({ chunk, turnIndex }) => turnIndex !== undefined
+                                                    ? <button key={chunk} className="rounded-lg border border-amber-400/20 px-3 py-1 text-xs hover:bg-amber-400/10" onClick={() => { setActiveTab(Tab.TRANSCRIPT); setReviewTurn({ index: turnIndex, request: Date.now() }); }}>Revisar segmento {chunk}</button>
+                                                    : <span key={chunk} className="text-xs">Segmento {chunk}</span>)}
+                                            </div>
+                                            <details className="mt-2 text-xs"><summary className="cursor-pointer">Detalle de empalmes</summary><ul className="mt-1 space-y-1 leading-relaxed">{notice.overlapWarnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul></details>
+                                        </>}
+                                        {notice.otherWarnings.length > 0 && <ul className="mt-2 space-y-1 text-xs leading-relaxed">{notice.otherWarnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul>}
                                     </div>
                                 </div>
                             )}
+
+                            <ProcessingTimingSummary timings={meetingData.processing_timings} />
+
+                            {meetingData.transcript_raw.trim() && <div className="mb-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5 space-y-3 text-sm text-slate-300">
+                                {(meetingData.analysis_review?.minutes || meetingData.analysis_review?.tasks) && !dismissedNotices.includes(analysisNoticeKey) && <div className="relative pr-9 text-amber-200">
+                                    {meetingData.analysis_review.minutes ? `${modeCopy(meetingData.mode).minuteTitle} pendiente de revisión. ` : ''}
+                                    {meetingData.analysis_review.tasks ? 'Tareas de esta reunión pendientes de revisión. ' : ''}
+                                    Las correcciones de hablantes no regeneran el análisis automáticamente.
+                                    <CloseNoticeButton onClose={() => dismissNotice(analysisNoticeKey)} />
+                                </div>}
+                                <div className="flex flex-wrap items-center gap-3">
+                                    <button disabled={isRegenerating} onClick={regenerateAnalysis} className="rounded-xl border border-executive-emerald/40 px-4 py-2 text-executive-emerald disabled:opacity-40">{isRegenerating ? 'Generando propuesta…' : 'Regenerar análisis con Gemini'}</button>
+                                    {meetingData.analysis_review?.tasks && <button disabled={isRegenerating} className="rounded-xl border border-white/20 px-4 py-2" onClick={() => {
+                                        invalidateAnalysisDraft(); setSpeakerHistory([]);
+                                        setMeetingData(prev => ({ ...prev, analysis_review: { minutes: prev.analysis_review?.minutes === true, tasks: false } }));
+                                    }}>Marcar tareas como revisadas</button>}
+                                </div>
+                                <p className="text-xs text-slate-500">Regenerar envía la transcripción corregida a Gemini y puede generar costo. Verás una propuesta antes de aplicarla; las tareas existentes se conservan.</p>
+                            </div>}
+
+                            {analysisDraft && <div className="mb-8 rounded-2xl border border-executive-emerald/30 p-5 space-y-4">
+                                <h3 className="font-bold text-executive-emerald">Propuesta de análisis · {formatElapsed(analysisDraft.elapsedMs)} observados (red + API)</h3>
+                                <MinutesView minutes={analysisDraft.analysis.minutes} mode={meetingData.mode} />
+                                {!isConference(meetingData.mode) && <div className="space-y-2 text-sm text-slate-300">
+                                    <p>Selecciona únicamente tareas nuevas. Se omiten descripciones iguales a tareas existentes, aunque cambie el responsable; revisa también posibles reformulaciones.</p>
+                                    {analysisDraft.proposals.length === 0 && <p className="text-slate-500">No hay propuestas con una descripción nueva.</p>}
+                                    {analysisDraft.proposals.map(t => <label key={t.id} className="flex gap-3 rounded-xl bg-white/5 p-3">
+                                        <input type="checkbox" checked={selectedProposals.includes(t.id)} onChange={e => setSelectedProposals(prev => e.target.checked ? [...prev, t.id] : prev.filter(id => id !== t.id))} />
+                                        <span>{t.description} — {t.assignee || 'Sin asignar'}</span>
+                                    </label>)}
+                                </div>}
+                                <div className="flex flex-wrap gap-3">
+                                    <button onClick={applyAnalysisDraft} className="rounded-xl bg-executive-emerald px-4 py-2 font-bold text-black">Aplicar {modeCopy(meetingData.mode).minuteTitle}{selectedProposals.length ? ` y ${selectedProposals.length} tareas nuevas` : ''}</button>
+                                    <button onClick={invalidateAnalysisDraft} className="rounded-xl border border-white/20 px-4 py-2 text-slate-300">Descartar propuesta</button>
+                                </div>
+                            </div>}
 
                             {activeTab === Tab.TASKS && (
                                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
@@ -3240,10 +4602,20 @@ function App() {
                                 <div className="max-w-7xl bg-executive-slate/50 backdrop-blur-xl border border-white/10 p-8 rounded-[2.5rem] shadow-2xl">
                                     <TranscriptView
                                         transcriptRaw={meetingData.transcript_raw}
+                                        transcriptTurns={meetingData.transcript_turns}
                                         minutes={meetingData.minutes}
                                         tasks={persistentTasks}
                                         mode={meetingData.mode}
                                         processingWarnings={meetingData.processing_warnings}
+                                        processingTimings={meetingData.processing_timings}
+                                        analysisReview={meetingData.analysis_review}
+                                        reviewTurn={reviewTurn}
+                                        onSpeakerEdit={editSpeaker}
+                                        onUndo={undoSpeaker}
+                                        canUndo={speakerHistory.length > 0}
+                                        editingDisabled={isRegenerating}
+                                        dismissedNotices={dismissedNotices}
+                                        onDismissNotice={dismissNotice}
                                     />
                                 </div>
                             )}
