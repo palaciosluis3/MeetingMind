@@ -12,6 +12,10 @@ equipo, salvo el audio que se envía al proveedor de IA para transcribirlo.
 
 ## Requisitos
 
+Las pruebas locales de regresión y su comando de ejecución están documentados en
+[tests/README.md](tests/README.md). Usan datos sintéticos y no acceden a tu configuración,
+base de datos ni APIs de IA.
+
 | | |
 |---|---|
 | **Sistema** | Windows 10 u 11 |

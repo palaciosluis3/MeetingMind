@@ -348,7 +348,8 @@ const generateStructured = async (
     promptText: string,
     contentPart: any,
     responseSchema: any,
-    taskName: string
+    taskName: string,
+    maxOutputTokens?: number
 ): Promise<any> => {
     const runOnce = async () => {
         const contentParts = Array.isArray(contentPart) ? contentPart : [contentPart];
@@ -363,6 +364,7 @@ const generateStructured = async (
                 generationConfig: {
                     responseMimeType: "application/json",
                     responseSchema: responseSchema,
+                    ...(maxOutputTokens ? { maxOutputTokens } : {}),
                 }
             });
             result = await model.generateContent([
@@ -379,6 +381,7 @@ const generateStructured = async (
                     systemInstruction: systemInstruction,
                     responseMimeType: "application/json",
                     responseSchema: responseSchema,
+                    ...(maxOutputTokens ? { maxOutputTokens } : {}),
                 }
             });
         } else {
@@ -499,7 +502,7 @@ export interface TurnSegment {
         kind: 'reassign' | 'merge' | 'segment-map';
         previous: Pick<TurnSegment, 'speaker' | 'speakerId' | 'speakerName' | 'speakerIdentityMethod' | 'speakerIdentityEvidence' | 'speakerNameEvidence'>;
     }[];
-    textEncodingRepair?: { kind: 'escaped-utf8', originalText: string };
+    textEncodingRepair?: { kind: 'escaped-utf8' | 'html-entities' | 'mixed-encoding', originalText: string };
 }
 
 interface SpeakerRecord {
@@ -640,6 +643,9 @@ const migrateTask = (task: any): Task => {
     } as Task;
 };
 
+// Model IDs are request-local. Stored/imported tasks use migrateTask alone.
+const createAnalysisTask = (task: any): Task => ({ ...migrateTask(task), id: crypto.randomUUID(), completed: false });
+
 // 'meeting' produces minutes + tasks; 'conference' produces minutes with key
 // ideas and an empty task list. The four `minutes` fields are the same in both —
 // only their meaning and their on-screen titles change (see MODE_COPY).
@@ -652,6 +658,7 @@ interface ProcessingTimings {
     segmentsTotal: number;
     segmentsSucceeded: number;
     segmentsFailed: number;
+    segmentsPartial?: number; // usable fragments with missing/suspect content
     uploadIncludesReadiness?: boolean;
     uploadCombinedWithApi?: boolean;
 }
@@ -681,6 +688,7 @@ const readProcessingTimings = (value: any): ProcessingTimings | undefined => {
     });
     return { totalMs: value.totalMs, stagesMs, segmentsTotal: value.segmentsTotal,
         segmentsSucceeded: value.segmentsSucceeded, segmentsFailed: value.segmentsFailed,
+        segmentsPartial: count(value.segmentsPartial) && value.segmentsPartial <= value.segmentsSucceeded ? value.segmentsPartial : undefined,
         uploadIncludesReadiness: value.uploadIncludesReadiness === true,
         uploadCombinedWithApi: value.uploadCombinedWithApi === true };
 };
@@ -688,7 +696,7 @@ const readProcessingTimings = (value: any): ProcessingTimings | undefined => {
 // Sequential observation only: this never changes requests, retries or chunk policy.
 const createProcessingClock = (onProgress?: (progress: ProcessingProgress) => void) => {
     const startedAt = performance.now();
-    const timings: ProcessingTimings = { totalMs: 0, stagesMs: {}, segmentsTotal: 0, segmentsSucceeded: 0, segmentsFailed: 0 };
+    const timings: ProcessingTimings = { totalMs: 0, stagesMs: {}, segmentsTotal: 0, segmentsSucceeded: 0, segmentsFailed: 0, segmentsPartial: 0 };
     let currentStage: ProcessingStage | undefined;
     let stageStartedAt: number | undefined;
     const publish = () => onProgress?.({ ...timings, stagesMs: { ...timings.stagesMs }, startedAt, currentStage, stageStartedAt });
@@ -702,8 +710,8 @@ const createProcessingClock = (onProgress?: (progress: ProcessingProgress) => vo
     return {
         start(stage: ProcessingStage) { pause(); currentStage = stage; stageStartedAt = performance.now(); publish(); },
         pause() { pause(); publish(); },
-        setSegments(total: number, succeeded: number, failed: number) {
-            Object.assign(timings, { segmentsTotal: total, segmentsSucceeded: succeeded, segmentsFailed: failed }); publish();
+        setSegments(total: number, succeeded: number, failed: number, partial: number = 0) {
+            Object.assign(timings, { segmentsTotal: total, segmentsSucceeded: succeeded, segmentsFailed: failed, segmentsPartial: partial }); publish();
         },
         markUploadReadiness() { timings.uploadIncludesReadiness = true; publish(); },
         markCombinedUpload() { timings.uploadCombinedWithApi = true; publish(); },
@@ -810,20 +818,77 @@ const repairEscapedUtf8 = (s: string): string => s.replace(
     }
 );
 
+// Decode a bounded set of text entities, never HTML markup. Keep code examples,
+// unknown/malformed entities and invalid numeric scalars exactly as received.
+const TEXT_ENTITIES: Record<string, string> = {
+    aacute: 'á', eacute: 'é', iacute: 'í', oacute: 'ó', uacute: 'ú', ntilde: 'ñ', uuml: 'ü',
+    Aacute: 'Á', Eacute: 'É', Iacute: 'Í', Oacute: 'Ó', Uacute: 'Ú', Ntilde: 'Ñ', Uuml: 'Ü',
+    iquest: '¿', iexcl: '¡', agrave: 'à', egrave: 'è', igrave: 'ì', ograve: 'ò', ugrave: 'ù',
+    acirc: 'â', ecirc: 'ê', icirc: 'î', ocirc: 'ô', ucirc: 'û', ccedil: 'ç',
+    auml: 'ä', euml: 'ë', iuml: 'ï', ouml: 'ö', nbsp: '\u00a0',
+    amp: '&', quot: '"', apos: "'", lt: '<', gt: '>',
+};
+const repairTextEntities = (s: string): string => s.replace(
+    /(```[\s\S]*?```|`[^`\n]*`)|&([a-z][a-z0-9]*|#(?:x[0-9a-f]+|[0-9]+));/gi,
+    (match, code, entity) => {
+        if (code) return match;
+        if (Object.prototype.hasOwnProperty.call(TEXT_ENTITIES, entity)) return TEXT_ENTITIES[entity];
+        if (!entity.startsWith('#')) return match;
+        const hex = /^#x/i.test(entity), value = parseInt(entity.slice(hex ? 2 : 1), hex ? 16 : 10);
+        // Plain text only: the view still renders a React text child, never HTML.
+        if (!(value >= 0x20 && value <= 0x10ffff) || value >= 0xd800 && value <= 0xdfff ||
+            value === 0xfffd || (value & 0xffff) >= 0xfffe) return match;
+        const decoded = String.fromCodePoint(value);
+        return /[\p{Cc}\p{Cf}\p{Cs}]/u.test(decoded) ? match : decoded;
+    }
+);
+const repairTextEncoding = (s: string): string => repairTextEntities(repairEscapedUtf8(s));
+const textEncodingAudit = (originalText: string): TurnSegment['textEncodingRepair'] => {
+    const utf8 = repairEscapedUtf8(originalText), final = repairTextEntities(utf8);
+    return final === originalText ? undefined : { originalText,
+        kind: utf8 === originalText ? 'html-entities' : final === utf8 ? 'escaped-utf8' : 'mixed-encoding' };
+};
+
+// This detects representations, not missing words. The ú pattern is a warning
+// heuristic for Spanish-looking text, never a replacement rule or language ID.
+const transcriptEncodingIssue = (turns: TurnSegment[]): string | undefined => {
+    const text = turns.map(t => t.text).join(' ').replace(/```[\s\S]*?```|`[^`\n]*`/g, '');
+    let reason: string | undefined;
+    if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\ufffd]/.test(text)) reason = 'caracteres de control o sustitución en el texto';
+    else if (/(?<!\\)\\x[0-9a-f]{2}|&(?:[a-z]{2,}[a-z0-9]*;|#(?:x[0-9a-f]+|[0-9]+);|(?:[aeiou]ac|ntil|uuml|iquest|iexcl)[a-z]*(?:;|\b))/i.test(text)) reason = 'códigos de texto que no pudieron convertirse con seguridad';
+    else if (text.length >= 300 && (text.match(/ú/gi) || []).length >= 8 && !/[áéíóñ¿¡]/i.test(text) &&
+        (text.match(/\b(?:que|de|la|el|en|los|las|una)\b/gi) || []).length >= 10) reason = 'sustitución sistemática por ú sospechosa';
+    return reason ? `Texto con codificación posiblemente dañada: ${reason}; transcripción parcial, requiere revisión.` : undefined;
+};
+const markTranscriptEncodingIssues = (turns: TurnSegment[]): TurnSegment[] => {
+    const groups = new Map<string, number[]>();
+    turns.forEach((t, i) => {
+        const s = t.source, key = s ? JSON.stringify([s.provider, s.chunkIndex, s.audioStartSec, s.contentStartSec, s.durationSec]) : 'legacy';
+        const indices = groups.get(key) || [];
+        indices.push(i); groups.set(key, indices);
+    });
+    const warnings = new Map<number, string>();
+    groups.forEach(indices => {
+        const issue = transcriptEncodingIssue(indices.map(i => turns[i]));
+        if (issue) warnings.set(indices[indices.length - 1], issue);
+    });
+    return turns.map((t, i) => warnings.has(i) ? { ...t,
+        integrityWarnings: Array.from(new Set([...(t.integrityWarnings || []), warnings.get(i)!])) } : t);
+};
+
 const repairHumanText = (value: any): any => {
-    if (typeof value === 'string') return repairEscapedUtf8(value);
+    if (typeof value === 'string') return repairTextEncoding(value);
     if (Array.isArray(value)) return value.map(repairHumanText);
     if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, v]) => [key, repairHumanText(v)]));
     return value;
 };
 
 const cleanTurnText = (s: string): string =>
-    repairEscapedUtf8(s).replace(/^["″“”]+|["″“”]+$/g, '').replace(/\s+/g, ' ').trim();
+    repairTextEncoding(s).replace(/^["″“”]+|["″“”]+$/g, '').replace(/\s+/g, ' ').trim();
 
 const withRepairedTurnText = (turn: TurnSegment, originalText: string): TurnSegment => {
-    const repaired = repairEscapedUtf8(originalText);
     return { ...turn, text: cleanTurnText(originalText),
-        textEncodingRepair: repaired !== originalText ? turn.textEncodingRepair || { kind: 'escaped-utf8', originalText } : turn.textEncodingRepair };
+        textEncodingRepair: turn.textEncodingRepair || textEncodingAudit(originalText) };
 };
 
 // Parse a raw transcript string back into turns. Handles three shapes:
@@ -854,7 +919,7 @@ const parseTranscriptTurns = (raw: string): TurnSegment[] => {
 
     if (pending) {
         turns.push(withRepairedTurnText({ startSec: pending.startSec, speaker: pending.speaker, text: '' }, raw.slice(pending.textFrom)));
-        return turns.filter(t => t.text);
+        return markTranscriptEncodingIssues(turns.filter(t => t.text));
     }
 
     // No bracketed markers at all — fall back to line-based "Name: text".
@@ -863,18 +928,18 @@ const parseTranscriptTurns = (raw: string): TurnSegment[] => {
         const head = line.match(/^([^:]{1,120}?)\s*:\s+(.*)$/);
         if (head && looksLikeSpeaker(head[1])) {
             if (current) turns.push(current);
-            current = withRepairedTurnText({ speaker: repairEscapedUtf8(head[1].trim()), text: '' }, head[2]);
+            current = withRepairedTurnText({ speaker: repairTextEncoding(head[1].trim()), text: '' }, head[2]);
         } else if (current) {
             const originalText = (current.textEncodingRepair?.originalText || current.text) + ' ' + line;
             current.text = (current.text ? current.text + ' ' : '') + cleanTurnText(line);
-            if (repairEscapedUtf8(originalText) !== originalText) current.textEncodingRepair = { kind: 'escaped-utf8', originalText };
+            current.textEncodingRepair = textEncodingAudit(originalText);
         } else {
             current = withRepairedTurnText({ speaker: 'Desconocido', text: '' }, line);
         }
     });
     if (current) turns.push(current);
 
-    return turns.filter(t => t.text);
+    return markTranscriptEncodingIssues(turns.filter(t => t.text));
 };
 
 // Shared by persistence, import, rename and exports; never edit the raw projection
@@ -885,7 +950,7 @@ const withTranscript = (meeting: MeetingData, turns: TurnSegment[]): MeetingData
 
 const readStoredTurns = (value: unknown): TurnSegment[] => {
     if (!Array.isArray(value)) throw new Error('La transcripción estructurada debe ser una lista.');
-    return value.map((t: any) => {
+    return markTranscriptEncodingIssues(value.map((t: any) => {
         if (!t || typeof t.speaker !== 'string' || !t.speaker.trim() || typeof t.text !== 'string' || !t.text.trim()) {
             throw new Error('Intervención estructurada sin hablante o texto válido.');
         }
@@ -911,16 +976,16 @@ const readStoredTurns = (value: unknown): TurnSegment[] => {
             if (outside(startSec)) { startSec = undefined; warnings.push('Inicio almacenado fuera del fragmento; se conservó el texto.'); }
             if (outside(endSec)) { endSec = undefined; warnings.push('Fin almacenado fuera del fragmento; se conservó el texto.'); }
         }
-        const decodedText = repairEscapedUtf8(t.text.trim());
+        const decodedText = repairTextEncoding(t.text.trim());
         return {
-            startSec, endSec, speaker: repairEscapedUtf8(t.speaker.trim()), text: decodedText, source,
+            startSec, endSec, speaker: repairTextEncoding(t.speaker.trim()), text: decodedText, source,
             sourceId: typeof t.sourceId === 'string' || (typeof t.sourceId === 'number' && Number.isFinite(t.sourceId)) ? t.sourceId : undefined,
             integrityWarnings: warnings.length ? warnings : undefined,
             overlapStatus: ['uncertain', 'prefix-trimmed'].includes(t.overlapStatus) ? t.overlapStatus : undefined,
             localSpeakerId: typeof t.localSpeakerId === 'string' && t.localSpeakerId.trim() ? t.localSpeakerId : undefined,
             speakerReferenceName: typeof t.speakerReferenceName === 'string' && t.speakerReferenceName.trim() ? t.speakerReferenceName : undefined,
             speakerId: typeof t.speakerId === 'string' && t.speakerId.trim() ? t.speakerId : undefined,
-            speakerName: typeof t.speakerName === 'string' && t.speakerName.trim() ? repairEscapedUtf8(t.speakerName.trim()) : undefined,
+            speakerName: typeof t.speakerName === 'string' && t.speakerName.trim() ? repairTextEncoding(t.speakerName.trim()) : undefined,
             speakerIdentityMethod: ['request-local', 'voice-reference', 'adjacent-overlap', 'manual'].includes(t.speakerIdentityMethod) ? t.speakerIdentityMethod : undefined,
             speakerIdentityEvidence: t.speakerIdentityEvidence && typeof t.speakerIdentityEvidence === 'object' ? {
                 referenceName: typeof t.speakerIdentityEvidence.referenceName === 'string' ? t.speakerIdentityEvidence.referenceName : undefined,
@@ -934,10 +999,10 @@ const readStoredTurns = (value: unknown): TurnSegment[] => {
             speakerNameEvidence: t.speakerNameEvidence && ['self-introduction', 'direct-address-response', 'handoff-response', 'manual'].includes(t.speakerNameEvidence.kind) ? {
                 kind: t.speakerNameEvidence.kind,
                 turnIndices: Array.isArray(t.speakerNameEvidence.turnIndices) ? t.speakerNameEvidence.turnIndices.filter((i: any) => Number.isInteger(i) && i >= 0) : undefined,
-                quote: typeof t.speakerNameEvidence.quote === 'string' ? repairEscapedUtf8(t.speakerNameEvidence.quote) : undefined,
+                quote: typeof t.speakerNameEvidence.quote === 'string' ? repairTextEncoding(t.speakerNameEvidence.quote) : undefined,
             } : undefined,
-            textEncodingRepair: t.textEncodingRepair?.kind === 'escaped-utf8' && typeof t.textEncodingRepair.originalText === 'string'
-                ? { kind: 'escaped-utf8', originalText: t.textEncodingRepair.originalText } : decodedText !== t.text.trim() ? { kind: 'escaped-utf8', originalText: t.text } : undefined,
+            textEncodingRepair: ['escaped-utf8', 'html-entities', 'mixed-encoding'].includes(t.textEncodingRepair?.kind) && typeof t.textEncodingRepair.originalText === 'string'
+                ? { kind: t.textEncodingRepair.kind, originalText: t.textEncodingRepair.originalText } : textEncodingAudit(t.text),
             speakerCorrections: Array.isArray(t.speakerCorrections) ? t.speakerCorrections.filter((c: any) =>
                 ['reassign', 'merge', 'segment-map'].includes(c?.kind) && typeof c.previous?.speaker === 'string').map((c: any) => ({
                     kind: c.kind,
@@ -945,7 +1010,7 @@ const readStoredTurns = (value: unknown): TurnSegment[] => {
                         ({ speaker, speakerId, speakerName, speakerIdentityMethod, speakerIdentityEvidence, speakerNameEvidence }))(c.previous),
                 })) : undefined,
         };
-    });
+    }));
 };
 
 const meetingTurns = (meeting: Pick<MeetingData, 'transcript_raw' | 'transcript_turns'>): TurnSegment[] =>
@@ -953,6 +1018,9 @@ const meetingTurns = (meeting: Pick<MeetingData, 'transcript_raw' | 'transcript_
 
 const turnWarnings = (turns: TurnSegment[]): string[] =>
     Array.from(new Set(turns.flatMap(t => t.integrityWarnings || [])));
+
+const isMissingTranscriptWarning = (warning: string): boolean =>
+    /no pudo transcribirse|omitido:|proceso se interrumpió|Contenido de Gemini omitido:|Transcripción de Gemini posiblemente incompleta:|Texto con codificación posiblemente dañada:/i.test(warning);
 
 const isOverlapNotice = (warning: string): boolean => /^(?:Segmento \d+\/\d+: )?Empalme incierto:/.test(warning);
 const processingNotice = (meeting: Pick<MeetingData, 'processing_warnings' | 'transcript_raw' | 'transcript_turns'>) => {
@@ -971,7 +1039,8 @@ const processingNotice = (meeting: Pick<MeetingData, 'processing_warnings' | 'tr
         }
     });
     const count = chunks.size;
-    const partial = otherWarnings.some(w => !w.startsWith('Análisis anterior:') && /no pudo transcribirse|omitido:|no se pudo generar|proceso se interrumpió/i.test(w));
+    const partial = otherWarnings.some(w => !w.startsWith('Análisis anterior:') &&
+        (isMissingTranscriptWarning(w) || /no se pudo generar/i.test(w)));
     const title = partial ? 'Resultado parcial' : overlapWarnings.length && !otherWarnings.length
         ? count ? `Transcripción generada · ${count} ${count === 1 ? 'empalme por revisar' : 'empalmes por revisar'}`
             : 'Transcripción generada · Empalmes por revisar'
@@ -1262,7 +1331,7 @@ const transcriptionSystem = (speakerContext: GeminiSpeakerContext, previousTail:
         - Conserva lo pronunciado: cifras, unidades, negaciones, nombres, compromisos, tecnicismos y matices.
         - No resumas, parafrasees ni corrijas el sentido. Conserva repeticiones audibles, énfasis y autocorrecciones.
         - No generes bucles de texto ausentes del audio. Escribe [inaudible] solo donde no puedas entender; continúa con lo audible.
-        - Escribe texto natural con tildes y signos Unicode, sin representar las letras como códigos o bytes.
+        - Escribe text con la ortografía natural del idioma hablado. En español, usa directamente las letras á, é, í, ó, ú, ñ, ü y los signos ¿, ¡.
 
         VOCES LOCALES:
         - Asigna etiquetas locales Hablante 1, Hablante 2, etc. a las voces del audio PRINCIPAL. No uses nombres humanos ni tokens de muestras como etiquetas de segments.
@@ -1346,13 +1415,15 @@ const normalizeGeminiTurns = (res: any, context: TranscriptChunkContext, referen
         matches.set(m.speaker.trim(), m.reference);
     });
     let latestStart: number | undefined;
-    const turns = segments.map(({ segment: s, index }: any) => {
-        if (!s || typeof s !== 'object' || !Object.prototype.hasOwnProperty.call(s, 'time') ||
+    const discarded: { index: number, kind: 'format' | 'content' }[] = [];
+    const turns = segments.flatMap(({ segment: s, index }: any) => {
+        if (!s || typeof s !== 'object' || Array.isArray(s) || !Object.prototype.hasOwnProperty.call(s, 'time') ||
             typeof s.speaker !== 'string' || !s.speaker.trim() || typeof s.text !== 'string') {
-            throw new GeminiResponseError('format', 'Intervención de Gemini sin los campos time, speaker y text requeridos.');
+            discarded.push({ index, kind: 'format' });
+            return [];
         }
         const text = cleanTurnText(s.text);
-        if (!text) throw new GeminiResponseError('content', 'Gemini devolvió una intervención con texto vacío.');
+        if (!text) { discarded.push({ index, kind: 'content' }); return []; }
         const start = typeof s.time === 'string' ? parseTimeToSeconds(s.time.trim()) : undefined;
         // Gemini endpoints remain generated estimates, never native measurements.
         const end = typeof s.end === 'string' ? parseTimeToSeconds(s.end.trim()) : s.end;
@@ -1365,13 +1436,23 @@ const normalizeGeminiTurns = (res: any, context: TranscriptChunkContext, referen
             }
             latestStart = Math.max(latestStart ?? turn.startSec, turn.startSec);
         }
-        return withRepairedTurnText(turn, s.text);
+        return [withRepairedTurnText(turn, s.text)];
     });
+    if (!turns.length) {
+        throw new GeminiResponseError(discarded.some(d => d.kind === 'format') ? 'format' : 'content',
+            'Gemini no devolvió ninguna intervención utilizable; la respuesta no indica ausencia de audio.');
+    }
+    if (discarded.length) {
+        const warning = `Contenido de Gemini omitido: ${discarded.length} intervenciones vacías o mal formadas; transcripción parcial.`;
+        console.warn(`[TRANSCRIPTION] ${warning}`, { interventionIndices: discarded.map(d => d.index) });
+        const last = turns[turns.length - 1];
+        last.integrityWarnings = [...(last.integrityWarnings || []), warning];
+    }
     if (segments.length !== res.segments.length) {
         const last = turns[turns.length - 1];
         last.integrityWarnings = [...(last.integrityWarnings || []), 'Gemini incluyó un aviso de sistema junto con habla; se conservó la transcripción disponible.'];
     }
-    return turns;
+    return markTranscriptEncodingIssues(turns);
 };
 
 // Transcribe one audio segment into absolute-timestamped turns.
@@ -1401,10 +1482,13 @@ const transcribeAudioSegment = async (
     const res = await generateStructured(
         ai,
         transcriptionSystem(speakerContext, previousTail, mode, references),
-        "Realiza la transcripción completa y verbatim de este segmento de audio, separando a los hablantes en entradas distintas.",
+        `Realiza la transcripción completa y verbatim del AUDIO PRINCIPAL (${context.durationSec} segundos), separando a los hablantes en entradas distintas. Revisa el archivo íntegro hasta su final; las muestras y la vista de voces no sustituyen ese archivo. Conserva lo audible después de cualquier silencio, sin inventar entradas para los silencios.`,
         contentParts,
         buildTranscriptionSchema(references),
-        "TRANSCRIPTION"
+        "TRANSCRIPTION",
+        // Bound pathological loops without imposing a speech/turn count. This
+        // is an output safety budget, never evidence that all audio was covered.
+        Math.min(16000, Math.max(4096, Math.ceil(context.durationSec * 26)))
     );
 
     return normalizeGeminiTurns(res, context, references);
@@ -1475,7 +1559,7 @@ const analyzeTranscript = async (
             ? `A continuación la transcripción ${isPartial ? 'disponible' : 'completa'} de la conferencia. Analízala y extrae la relatoría y las ideas clave. NO extraigas tareas.`
             : `A continuación la transcripción ${isPartial ? 'disponible' : 'completa'} de la reunión. Analízala estratégicamente (minuta, decisiones y tareas).`) +
             (isPartial
-                ? "\n\nADVERTENCIA: algunos segmentos del audio no pudieron transcribirse. Trabaja únicamente con el contenido disponible, no completes los vacíos ni inventes decisiones, participantes o tareas."
+                ? "\n\nADVERTENCIA: la transcripción es parcial o presenta indicios de contenido ausente (fragmentos o intervenciones no recuperables, o respuesta escasa). Trabaja únicamente con el contenido disponible, no completes los vacíos ni inventes decisiones, participantes o tareas."
                 : ""),
         { text: fullTranscript },
         conference ? buildConferenceSchema() : buildAnalysisSchema(owner),
@@ -1485,7 +1569,7 @@ const analyzeTranscript = async (
     return {
         ...repairHumanText(rawAnalysis),
         mode: conference ? MODE_CONFERENCE : MODE_MEETING,
-        tasks: conference ? [] : (Array.isArray(rawAnalysis?.tasks) ? repairHumanText(rawAnalysis.tasks) : []),
+        tasks: conference ? [] : (Array.isArray(rawAnalysis?.tasks) ? repairHumanText(rawAnalysis.tasks).map(createAnalysisTask) : []),
     };
 };
 
@@ -1596,10 +1680,11 @@ const resolveSpeakerNames = async (ai: any, turns: TurnSegment[]): Promise<TurnS
 
 const analyzeImportedTurns = async (turns: TurnSegment[], mode: string, warnings: string[] = [], clock?: ProcessingClock): Promise<MeetingData> => {
     if (!turns.length) throw new Error('El archivo no contiene intervenciones.');
+    warnings = Array.from(new Set([...warnings, ...turnWarnings(turns)]));
     clock?.start('analysis');
     try {
         const ai = new GenAI({ apiKey: getGeminiKey() });
-        const analysis = await analyzeTranscript(ai, serializeTranscript(turns), mode, warnings.length > 0);
+        const analysis = await analyzeTranscript(ai, serializeTranscript(turns), mode, warnings.some(isMissingTranscriptWarning));
         return withTranscript({ ...analysis, processing_warnings: warnings, processing_timings: clock?.finish() } as MeetingData, turns);
     } catch {
         // An analysis failure must not discard an already available transcript.
@@ -1795,6 +1880,92 @@ const referencePCMQuality = (pcm: ArrayBuffer): { rms: number, activeFraction: n
     return { rms, activeFraction };
 };
 
+// Signal activity is not speech recognition or proof of omitted words. It only
+// corroborates an exceptionally sparse reply to a long prepared main WAV.
+const geminiCompletenessIssue = async (turns: TurnSegment[], chunk: AudioChunk): Promise<string | undefined> => {
+    const newSeconds = chunk.durationSec - (chunk.contentStartSec - chunk.audioStartSec);
+    if (newSeconds < 120) return undefined;
+    const chars = turns.reduce((n, t) => n + t.text.length, 0);
+    const onlyOverlap = chunk.contentStartSec > chunk.audioStartSec && turns.every(t =>
+        isValidSeconds(t.endSec) && t.endSec <= chunk.contentStartSec);
+    if (chars > 120 && !onlyOverlap) return undefined;
+    try {
+        if (chunk.blob.size < 44) return undefined;
+        const header = new DataView(await chunk.blob.slice(0, 44).arrayBuffer());
+        const ascii = (off: number, length: number) => Array.from({ length }, (_, i) => String.fromCharCode(header.getUint8(off + i))).join('');
+        const dataBytes = header.getUint32(40, true);
+        if (ascii(0, 4) !== 'RIFF' || ascii(8, 4) !== 'WAVE' || ascii(12, 4) !== 'fmt ' || ascii(36, 4) !== 'data' ||
+            header.getUint32(16, true) !== 16 || header.getUint16(20, true) !== 1 || header.getUint16(22, true) !== 1 ||
+            header.getUint32(24, true) !== TARGET_SAMPLE_RATE || header.getUint16(34, true) !== 16 ||
+            dataBytes % 2 || dataBytes > chunk.blob.size - 44) return undefined;
+        // Eight distributed two-second probes; no second full recording/copy.
+        // Skip the first 30 new seconds so brief speech plus silence can pass.
+        const from = Math.ceil((chunk.contentStartSec - chunk.audioStartSec + 30) * TARGET_SAMPLE_RATE);
+        const windowSamples = 2 * TARGET_SAMPLE_RATE;
+        const last = dataBytes / 2 - windowSamples;
+        if (last <= from) return undefined;
+        let active = 0;
+        for (let i = 0; i < 8; i++) {
+            const start = Math.floor(from + (last - from) * i / 7);
+            const pcm = await chunk.blob.slice(44 + start * 2, 44 + (start + windowSamples) * 2).arrayBuffer();
+            if (referencePCMQuality(pcm) && ++active >= 2) {
+                return `Transcripción de Gemini posiblemente incompleta: ${onlyOverlap ? 'sólo hay intervenciones del solapamiento' : `sólo se recibieron ${chars} caracteres`} para ${Math.round(newSeconds)} segundos nuevos, con actividad de señal posterior. Esta comprobación no demuestra que la señal sea habla.`;
+            }
+        }
+    } catch (error) {
+        console.warn('[TRANSCRIPTION] No se pudo comprobar la respuesta escasa; se conserva el texto disponible.', error);
+    }
+    return undefined;
+};
+
+// Share the existing single retry budget with the degeneration guard. A retry
+// cannot discard a usable first response or mix request-local speaker labels.
+const transcribeCheckedGeminiSegment = async (
+    run: (isolated: boolean) => Promise<TurnSegment[]>, chunk: AudioChunk,
+    references: VoiceReference[], onRetry: (reason: string) => void
+): Promise<{ turns: TurnSegment[], references: VoiceReference[] }> => {
+    let first: TurnSegment[] | null = null;
+    let firstIssue: string | undefined;
+    let truncated = false;
+    try {
+        first = sanitizeSegmentTurns(await run(false), chunk.durationSec);
+        firstIssue = first ? transcriptEncodingIssue(first) || await geminiCompletenessIssue(first, chunk) : undefined;
+    } catch (error) {
+        // MAX_TOKENS is a received terminal response, not an uncertain network
+        // failure. Discard its JSON and spend the existing single retry on the
+        // main audio alone. Never reconstruct or accept an unfinished response.
+        if (!(error instanceof GeminiResponseError) || error.kind !== 'truncated') throw error;
+        truncated = true;
+        console.warn('[TRANSCRIPTION] Respuesta truncada rechazada; se reintentará una vez con el audio principal.');
+    }
+    if (first && !firstIssue) return { turns: first, references };
+    const isolated = truncated || Boolean(firstIssue);
+    if (firstIssue) console.warn(`[TRANSCRIPTION] ${firstIssue} Se reintentará una vez con el audio principal.`);
+    onRetry(truncated ? 'respuesta truncada' : first && transcriptEncodingIssue(first) ? 'codificación sospechosa'
+        : isolated ? 'respuesta posiblemente incompleta' : 'respuesta degenerada');
+    const partial = (turns: TurnSegment[], warning: string, used: VoiceReference[]) => ({
+        turns: turns.map((t, i) => i === turns.length - 1 ? { ...t, integrityWarnings: [...(t.integrityWarnings || []), warning] } : t),
+        references: used,
+    });
+    try {
+        const second = sanitizeSegmentTurns(await run(isolated), chunk.durationSec);
+        if (!second) throw new GeminiResponseError('degenerate', 'Gemini devolvió una respuesta degenerada en el único reintento.');
+        const secondIssue = transcriptEncodingIssue(second) || await geminiCompletenessIssue(second, chunk);
+        const used = isolated ? [] : references;
+        if (!secondIssue) return { turns: second, references: used };
+        const firstChars = first?.reduce((n, t) => n + t.text.length, 0) ?? 0;
+        const secondChars = second.reduce((n, t) => n + t.text.length, 0);
+        if (first && (!transcriptEncodingIssue(first) && transcriptEncodingIssue(second) ||
+            firstChars >= secondChars && !(transcriptEncodingIssue(first) && !transcriptEncodingIssue(second)))) {
+            return partial(first, `${firstIssue} Se conservó la primera respuesta tras el único reintento.`, references);
+        }
+        return partial(second, `${secondIssue} El único reintento no resolvió la limitación.`, used);
+    } catch (error: any) {
+        if (!first) throw error;
+        return partial(first, `${firstIssue} El único reintento falló (${error?.message || 'error desconocido'}); se conservó el texto recuperable.`, references);
+    }
+};
+
 // Optional short acoustic context for long Gemini inputs, never a second full
 // recording or a speaker-labelled reference. The main audio is still transcribed once.
 const buildGeminiVoicePreview = async (chunkWav: Blob): Promise<Blob | undefined> => {
@@ -1819,6 +1990,8 @@ const buildSpeakerReferences = async (
     const HEADER_BYTES = 44;
     if (!turns.length || !isValidSeconds(audioStartSec) || chunkWav.size < HEADER_BYTES ||
         turns.some(t => t.source?.timing !== timing)) return [];
+    // A discarded intervention has no usable bounds to screen for contamination.
+    if (turnWarnings(turns).some(isMissingTranscriptWarning)) return [];
     const hasUsableBounds = (t: TurnSegment): boolean =>
         t.source?.audioStartSec === audioStartSec && isValidSeconds(t.startSec) && isValidSeconds(t.endSec) && t.endSec > t.startSec && !t.integrityWarnings?.length;
     if (timing === 'api' && turns.some(t => !hasUsableBounds(t))) return []; // native OpenAI policy stays strict
@@ -1836,8 +2009,10 @@ const buildSpeakerReferences = async (
     const overlapsSample = (from: number, to: number, other: TurnSegment): boolean => {
         const startKnown = isValidSeconds(other.startSec), endKnown = isValidSeconds(other.endSec);
         if (startKnown && endKnown) return other.startSec! < to && other.endSec! > from;
-        if (startKnown) return other.startSec! >= from && other.startSec! < to;
-        if (endKnown) return other.endSec! > from && other.endSec! <= to;
+        // An unknown end may extend beyond the window; an unknown start may
+        // precede it. Only the supplied opposite bound can prove separation.
+        if (startKnown) return other.startSec! < to;
+        if (endKnown) return other.endSec! > from;
         return true; // wholly unlocated speech cannot establish a clean sample
     };
     const intervals: (TurnSegment & { members: TurnSegment[] })[] = [];
@@ -2262,6 +2437,7 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
         const clock = createProcessingClock(onProcessingProgress);
         let segmentsSucceeded = 0;
         let segmentsFailed = 0;
+        let segmentsPartial = 0;
         onProvisionalTranscript?.([], []);
 
         try {
@@ -2353,22 +2529,15 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
                         onProcessingStart(`${label} · Transcribiendo (${displayName})`);
                         clock.start('transcription');
 
-                        const runSegment = () => transcribeAudioSegment(
-                            ai, source, seg.mimeType, speakerContext, previousTail, context, chosenMode, sentReferences, voicePreview
+                        const runSegment = (isolated: boolean) => transcribeAudioSegment(
+                            ai, source, seg.mimeType, isolated ? { previousLabels: [], confirmedNames: [] } : speakerContext,
+                            isolated ? '' : previousTail, context, chosenMode, isolated ? [] : sentReferences, isolated ? undefined : voicePreview
                         );
 
-                        // Retry once if the model fell into a repetition loop: a single
-                        // degenerate segment used to poison both the transcript and the
-                        // minutes generated from it.
-                        turns = await runSegment();
-                        let sane = sanitizeSegmentTurns(turns, seg.durationSec);
-                        if (!sane) {
-                            onProcessingStart(`${label} · Reintentando (respuesta degenerada)`);
-                            turns = await runSegment();
-                            sane = sanitizeSegmentTurns(turns, seg.durationSec);
-                        }
-                        if (!sane) throw new GeminiResponseError('degenerate', 'Gemini repitió una respuesta degenerada después del único reintento.');
-                        turns = sane;
+                        const checked = await transcribeCheckedGeminiSegment(runSegment, seg, sentReferences,
+                            reason => onProcessingStart(`${label} · Reintentando (${reason})`));
+                        turns = checked.turns;
+                        sentReferences = checked.references;
                     }
 
                     clock.start('reconciliation');
@@ -2376,11 +2545,13 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
                     // An empty provider response has the same operational meaning as
                     // the explicit Gemini no-audio sentinel: skip only this chunk.
                     if (!turns.length) throw new NoAudioDetectedError();
+                    const segmentIsPartial = turnWarnings(turns).some(isMissingTranscriptWarning);
+                    if (segmentIsPartial) hasMissingAudio = true;
                     if (chosen === PROVIDER_OPENAI_DIARIZE && !sanitizeSegmentTurns(turns, seg.durationSec)) {
                         throw new Error('Respuesta de diarización degenerada; no se construyeron referencias de voz.');
                     }
                     const hadPriorSpeakers = speakerRegistry.speakers.size > 0;
-                    const overlapLinks = chosen === PROVIDER_GEMINI && previousSegmentSucceeded
+                    const overlapLinks = chosen === PROVIDER_GEMINI && previousSegmentSucceeded && !segmentIsPartial
                         ? adjacentGeminiSpeakerLinks(previousTurns, turns, seg) : new Map();
                     turns = assignSpeakerIdentities(turns, speakerRegistry, sentReferences, overlapLinks);
                     if (i > 0 && hadPriorSpeakers) {
@@ -2408,14 +2579,15 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
                     // leading overlap: those seconds are otherwise absent from the
                     // partial transcript. Also do not feed an older tail across a gap.
                     const originalTurns = turns;
-                    if (i > 0 && previousSegmentSucceeded) turns = reconcileOverlapTurns(previousTurns, turns, seg);
+                    if (i > 0 && previousSegmentSucceeded && !segmentIsPartial) turns = reconcileOverlapTurns(previousTurns, turns, seg);
                     turnWarnings(turns).forEach(w => processingWarnings.push(`${label}: ${w}`));
                     allTurns = allTurns.concat(turns);
-                    speakerContext = collectSpeakers(originalTurns, speakerRegistry);
-                    previousTurns = originalTurns;
-                    previousTail = tailContext(originalTurns);
-                    previousSegmentSucceeded = true;
+                    speakerContext = segmentIsPartial ? { previousLabels: [], confirmedNames: [] } : collectSpeakers(originalTurns, speakerRegistry);
+                    previousTurns = segmentIsPartial ? [] : originalTurns;
+                    previousTail = segmentIsPartial ? '' : tailContext(originalTurns);
+                    previousSegmentSucceeded = !segmentIsPartial;
                     segmentsSucceeded++;
+                    if (segmentIsPartial) segmentsPartial++;
                 } catch (segmentError: any) {
                     if (isOpenAI(chosen) && openAIUploadStarted && !openAIUploadCompleted && !openAIRequestCompleted) {
                         clock.markCombinedUpload();
@@ -2437,7 +2609,7 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
                 }
 
                 clock.pause();
-                clock.setSegments(segments.length, segmentsSucceeded, segmentsFailed);
+                clock.setSegments(segments.length, segmentsSucceeded, segmentsFailed, segmentsPartial);
                 onProvisionalTranscript?.([...allTurns], [...processingWarnings]);
                 if (i < segments.length - 1) await new Promise(r => setTimeout(r, 1200));
             }
@@ -3944,14 +4116,15 @@ const migrateMeetingData = (stored: any): MeetingData => {
             return withRepairedTurnText({ startSec: time >= 0 ? time : undefined, speaker: t?.speaker || 'Unknown', text: '' }, t?.text || '');
         });
         delete data.transcript;
-        Object.assign(data, withTranscript(data, turns));
+        Object.assign(data, withTranscript(data, markTranscriptEncodingIssues(turns)));
     }
-    const repairedRaw = repairEscapedUtf8(data.transcript_raw);
+    const repairedRaw = repairTextEncoding(data.transcript_raw);
     if (repairedRaw !== data.transcript_raw) {
         data.transcript_encoding_original = data.transcript_encoding_original || data.transcript_raw;
         Object.assign(data, withTranscript(data, parseTranscriptTurns(data.transcript_raw)));
     }
-    data.processing_warnings = warnings;
+    warnings.push(...turnWarnings(meetingTurns(data as MeetingData)));
+    data.processing_warnings = Array.from(new Set(warnings));
     return data as MeetingData;
 };
 
@@ -4090,12 +4263,12 @@ const newAnalysisTaskProposals = (proposals: Task[], existing: Task[]): Task[] =
         if (seen.has(key)) return [];
         seen.add(key);
         // Never trust/reuse model task IDs or overwrite an accumulated task.
-        return [{ ...migrateTask(t), id: crypto.randomUUID(), completed: false }];
+        return [createAnalysisTask(t)];
     });
 };
 
 const transcriptHasMissingAudio = (meeting: MeetingData): boolean =>
-    (meeting.processing_warnings || []).some(w => /no pudo transcribirse|omitido:|proceso se interrumpió/i.test(w));
+    [...(meeting.processing_warnings || []), ...turnWarnings(meetingTurns(meeting))].some(isMissingTranscriptWarning);
 
 const applyRegeneratedAnalysis = (meeting: MeetingData, tasks: Task[], analysis: any, selected: Task[]): { meeting: MeetingData, tasks: Task[] } => {
     const added = isConference(meeting.mode) ? [] : newAnalysisTaskProposals(selected, [...tasks, ...meeting.tasks]);
@@ -4106,6 +4279,38 @@ const applyRegeneratedAnalysis = (meeting: MeetingData, tasks: Task[], analysis:
         },
         tasks: [...tasks, ...added],
     };
+};
+
+interface DatabaseSnapshot {
+    meetingData: MeetingData;
+    persistentTasks: Task[];
+}
+type DatabaseLoadState = 'loading' | 'loaded' | 'new' | 'error';
+type DatabaseSaveState = 'idle' | 'saving' | 'unsaved' | 'saved';
+
+const readDatabase = async (): Promise<DatabaseSnapshot & { kind: 'loaded' | 'new' }> => {
+    const response = await fetch('/api/db');
+    if (!response.ok) throw new Error(`No se pudo cargar la base de datos (HTTP ${response.status}).`);
+    const data = await response.json();
+    if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('La base de datos recibida no es un objeto JSON válido.');
+    // The existing server explicitly returns {} when no database exists.
+    const kind = Object.keys(data).length === 0 ? 'new' : 'loaded';
+    if (kind === 'loaded' && !('meetingData' in data) && !('persistentTasks' in data)) {
+        throw new Error('La respuesta no contiene una base de datos reconocible.');
+    }
+    if (data.persistentTasks != null && !Array.isArray(data.persistentTasks)) throw new Error('La lista de tareas guardadas no es válida.');
+    if (data.meetingData != null && (typeof data.meetingData !== 'object' || Array.isArray(data.meetingData))) {
+        throw new Error('La reunión guardada no es válida.');
+    }
+    return { kind, meetingData: migrateMeetingData(data.meetingData), persistentTasks: (data.persistentTasks || []).map(migrateTask) };
+};
+
+const writeDatabase = async (snapshot: DatabaseSnapshot): Promise<void> => {
+    const response = await fetch('/api/db', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...snapshot, lastSync: new Date().toISOString() }),
+    });
+    if (!response.ok) throw new Error(`No se pudieron guardar los cambios (HTTP ${response.status}).`);
 };
 
 function App() {
@@ -4140,7 +4345,15 @@ function App() {
         return () => window.clearInterval(timer);
     }, [isLoading]);
     const [isManualTaskModalOpen, setIsManualTaskModalOpen] = useState(false);
-    const [isInitialLoad, setIsInitialLoad] = useState(true);
+    const [databaseLoad, setDatabaseLoad] = useState<DatabaseLoadState>('loading');
+    const [databaseSave, setDatabaseSave] = useState<DatabaseSaveState>('idle');
+    const [databaseError, setDatabaseError] = useState('');
+    const databaseReady = databaseLoad === 'loaded' || databaseLoad === 'new';
+    const databaseReadRequest = useRef(0);
+    const persistence = useRef({ ready: false, saving: false, pending: null as DatabaseSnapshot | null, savedKey: null as string | null });
+    const latestDatabase = useRef<DatabaseSnapshot>({ meetingData, persistentTasks });
+    latestDatabase.current = { meetingData, persistentTasks };
+    const databaseSnapshotKey = React.useMemo(() => JSON.stringify({ meetingData, persistentTasks }), [meetingData, persistentTasks]);
     const [config, setConfig] = useState<AppConfig>(() => getConfig());
     const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
@@ -4148,54 +4361,77 @@ function App() {
     // by itself and cannot be dismissed until both are filled in.
     const needsSetup = !isConfigured(config);
 
-    // 1. Initial Load from Backend (Priority) or LocalStorage
+    // A failed read never authorizes writing an empty initial state. Editing is
+    // available only after a loaded/new response, so retry cannot overwrite edits.
+    const loadDatabase = async () => {
+        const request = ++databaseReadRequest.current;
+        persistence.current.ready = false;
+        setDatabaseLoad('loading'); setDatabaseError('');
+        try {
+            const { kind, ...snapshot } = await readDatabase();
+            if (request !== databaseReadRequest.current) return;
+            persistence.current.savedKey = JSON.stringify(snapshot);
+            latestDatabase.current = snapshot;
+            meetingRef.current = snapshot.meetingData; tasksRef.current = snapshot.persistentTasks;
+            setMeetingData(snapshot.meetingData); setPersistentTasks(snapshot.persistentTasks);
+            persistence.current.ready = true;
+            setDatabaseLoad(kind);
+        } catch (error: any) {
+            if (request !== databaseReadRequest.current) return;
+            setDatabaseError(error?.message || 'Error de lectura de la base de datos.');
+            setDatabaseLoad('error');
+        }
+    };
     useEffect(() => {
-        const initData = async () => {
-            try {
-                const response = await fetch('/api/db');
-                if (response.ok) {
-                    const data = await response.json();
-                    if (data.meetingData) {
-                        setMeetingData(migrateMeetingData(data.meetingData));
-                    }
-                    if (data.persistentTasks) {
-                        setPersistentTasks(Array.isArray(data.persistentTasks) ? data.persistentTasks.map(migrateTask) : []);
-                    }
-                }
-            } catch (err) {
-                console.log("Sistema Portable: Usando almacenamiento local (Backend no detectado)");
-            } finally {
-                setIsInitialLoad(false);
-            }
-        };
-        initData();
+        loadDatabase();
+        return () => { databaseReadRequest.current++; };
     }, []);
 
-    // 2. Persistent Saving (LocalStorage + Backend)
-    useEffect(() => {
-        if (isInitialLoad) return; // Don't save back during initial fetch
-
-        const saveToBackend = async () => {
-            try {
-                await fetch('/api/db', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        persistentTasks,
-                        meetingData,
-                        lastSync: new Date().toISOString()
-                    })
-                });
-            } catch (err) {
-                // Silently fail if backend is not running
+    // Serialize/coalesce writes: an older response cannot mark newer edits saved
+    // or overwrite them on disk. Retry always sends the latest in-memory state.
+    const saveDatabase = async () => {
+        const queue = persistence.current;
+        if (!queue.ready || queue.saving) return;
+        queue.saving = true;
+        try {
+            while (queue.pending) {
+                const snapshot = queue.pending;
+                queue.pending = null;
+                const key = JSON.stringify(snapshot);
+                if (key === queue.savedKey) continue;
+                setDatabaseSave('saving'); setDatabaseError('');
+                try {
+                    await writeDatabase(snapshot);
+                } catch (error: any) {
+                    // A failed response does not prove that the server kept its
+                    // old snapshot (it may have written before returning 500).
+                    queue.savedKey = null;
+                    queue.pending = latestDatabase.current;
+                    setDatabaseError(error?.message || 'No se pudo contactar al servidor para guardar.');
+                    setDatabaseSave('unsaved');
+                    return;
+                }
+                queue.savedKey = key;
+                if (JSON.stringify(latestDatabase.current) !== key) queue.pending = latestDatabase.current;
+                else { queue.pending = null; setDatabaseSave('saved'); }
             }
-        };
-        saveToBackend();
-    }, [persistentTasks, meetingData, isInitialLoad]);
+        } finally {
+            queue.saving = false;
+        }
+    };
+    const retryDatabaseSave = () => {
+        persistence.current.pending = latestDatabase.current;
+        saveDatabase();
+    };
+    useEffect(() => {
+        if (!databaseReady || !persistence.current.ready || databaseSnapshotKey === persistence.current.savedKey) return;
+        retryDatabaseSave();
+    }, [persistentTasks, meetingData, databaseLoad]);
 
     // Handle Import Event
     useEffect(() => {
         const handleImport = (e: any) => {
+            if (!persistence.current.ready) return;
             const importedTasks = e.detail as Task[];
             if (Array.isArray(importedTasks)) {
                 setPersistentTasks(prev => {
@@ -4280,6 +4516,7 @@ function App() {
     // Handle Clean Tasks Event
     useEffect(() => {
         const handleClean = () => {
+            if (!persistence.current.ready) return;
             setSpeakerHistory([]);
             invalidateAnalysisDraft();
             setPersistentTasks(prev => prev.filter(t => !t.completed));
@@ -4289,7 +4526,7 @@ function App() {
             }));
         };
 
-        const handleOpenModal = () => setIsManualTaskModalOpen(true);
+        const handleOpenModal = () => { if (persistence.current.ready) setIsManualTaskModalOpen(true); };
 
         window.addEventListener('CLEAN_TASKS', handleClean);
         window.addEventListener('OPEN_MANUAL_TASK_MODAL', handleOpenModal);
@@ -4393,7 +4630,7 @@ function App() {
                             onProcessingComplete={handleProcessingComplete}
                             onProcessingProgress={setProcessingProgress}
                             onProvisionalTranscript={(turns, warnings) => setProvisional({ turns, warnings })}
-                            disabled={isLoading || isRegenerating}
+                            disabled={!databaseReady || isLoading || isRegenerating}
                             onError={(err) => { setIsLoading(false); alert(err); }}
                         />
                         <button
@@ -4405,7 +4642,7 @@ function App() {
                         </button>
                         <button
                             onClick={clearDatabase}
-                            disabled={isLoading}
+                            disabled={!databaseReady || isLoading}
                             className="p-2 text-slate-500 hover:text-red-400 transition-colors rounded-lg hover:bg-slate-800"
                             title="Borrar todos los datos"
                         >
@@ -4425,7 +4662,21 @@ function App() {
 
             <main className="max-w-7xl mx-auto px-6 mt-8">
 
-                {isLoading ? (
+                {databaseLoad === 'error' && <div role="alert" className="mb-6 rounded-2xl border border-red-400/30 bg-red-400/[0.07] p-5 text-sm text-red-200">
+                    <p className="font-bold">No se pudo cargar la base. Guardado automático bloqueado para proteger los datos existentes.</p>
+                    <p className="mt-2">{databaseError}</p>
+                    <button onClick={loadDatabase} className="mt-3 rounded-xl border border-red-400/40 px-4 py-2">Reintentar carga</button>
+                </div>}
+                {databaseReady && databaseSave !== 'idle' && <div role="status" aria-live="polite" className="mb-6 rounded-2xl border border-white/15 p-4 text-sm text-slate-300">
+                    {databaseSave === 'saved' && databaseSnapshotKey === persistence.current.savedKey ? 'Cambios guardados.' : databaseSave === 'saving'
+                        ? 'Cambios sin guardar · Guardando…' : 'Cambios sin guardar. El estado se conserva en memoria; mantén esta ventana abierta.'}
+                    {databaseSave === 'unsaved' && <>
+                        <p className="mt-2 text-amber-200">{databaseError}</p>
+                        <button onClick={retryDatabaseSave} className="mt-3 rounded-xl border border-amber-400/40 px-4 py-2 text-amber-200">Reintentar guardado</button>
+                    </>}
+                </div>}
+
+                {!databaseReady ? (databaseLoad === 'loading' ? <p className="text-slate-400">Cargando base de datos…</p> : null) : isLoading ? (
                     <div className="flex flex-col items-center justify-center py-32 space-y-8">
                         <div className="relative w-32 h-32">
                             {/* Executive Spinner */}
@@ -4450,7 +4701,7 @@ function App() {
                             {processingProgress && <div className="mt-4 space-y-2 text-sm text-slate-400">
                                 <p>Transcurrido: <span className="font-mono text-slate-200">{formatElapsed(processingNow - processingProgress.startedAt)}</span></p>
                                 {processingProgress.currentStage && processingProgress.stageStartedAt !== undefined && <p>{PROCESSING_STAGE_LABELS[processingProgress.currentStage]}: {formatElapsed(processingNow - processingProgress.stageStartedAt)}</p>}
-                                {processingProgress.segmentsTotal > 0 && <p>{processingProgress.segmentsSucceeded + processingProgress.segmentsFailed}/{processingProgress.segmentsTotal} fragmentos procesados · {processingProgress.segmentsSucceeded} correctos{processingProgress.segmentsFailed > 0 ? ` · ${processingProgress.segmentsFailed} fallidos u omitidos` : ''}</p>}
+                                {processingProgress.segmentsTotal > 0 && <p>{processingProgress.segmentsSucceeded + processingProgress.segmentsFailed}/{processingProgress.segmentsTotal} fragmentos procesados · {processingProgress.segmentsSucceeded - (processingProgress.segmentsPartial || 0)} correctos{processingProgress.segmentsPartial ? ` · ${processingProgress.segmentsPartial} parciales` : ''}{processingProgress.segmentsFailed > 0 ? ` · ${processingProgress.segmentsFailed} fallidos u omitidos` : ''}</p>}
                                 <p className="text-xs text-slate-500">Tiempo transcurrido y fragmentos terminados; no es una estimación de inferencia.</p>
                             </div>}
                         </div>

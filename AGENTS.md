@@ -44,6 +44,42 @@ python server.pyw
 ```
 
 ### Testing
+- Current bounded regressions: `tests/small-corrections.cjs` compiles the complete
+  TSX with pinned Babel 7.23.0 and runs 24 synthetic offline groups. See
+  `tests/README.md` for execution and limits. It uses the actual compiled App,
+  InputPanel and helpers with local hook/transport/SDK fixtures, never personal
+  config/database or provider requests. Historical test files below may be absent;
+  do not assume they survived cleanup.
+- Persistence must distinguish a loaded database, the server's new-database `{}`
+  response and a load failure. Failed reads block editing/automatic writes until
+  a successful retry. Failed saves retain memory, show unsaved changes and offer
+  retry of the latest state; success requires an OK HTTP response. Writes are
+  serialized so stale requests cannot overwrite newer changes.
+- Fresh model tasks use `createAnalysisTask`/`crypto.randomUUID()` in shared
+  analysis and regeneration. Stored/restored/imported tasks use `migrateTask`
+  without replacing their IDs.
+- Invalid/empty Gemini interventions may be omitted from valid JSON while keeping
+  usable speech in order and the original `source.interventionIndex`. Persist the
+  content-loss warning on canonical turns and processing warnings; initial and
+  regenerated analysis must receive the partial flag. All-unusable entries remain
+  errors, distinct from explicit no-audio responses. Degeneration/JSON guards stay.
+  Do not seed references from a chunk with discarded speech of unknown bounds.
+  Other unknown endpoints conservatively screen only potentially intersecting
+  sample windows; a known opposite bound can still prove separation.
+- Gemini JSON validity does not prove coverage. For exceptionally sparse replies
+  to long prepared WAV chunks, `geminiCompletenessIssue` uses bounded signal probes
+  as corroboration, never as speech recognition. `transcribeCheckedGeminiSegment`
+  shares the existing single validation-retry budget with degeneration. Suspected
+  incompleteness retries the same uploaded main audio without references, preview
+  or textual tail; do not bind tokens that were not sent in that retry. Preserve
+  usable first speech if retry fails, record a possibly-incomplete warning and
+  pass the partial flag to initial/regenerated analysis. Partial chunks cannot
+  seed references or supply adjacent continuity/reconciliation for the next one.
+  Optional `segmentsPartial` distinguishes them in progress and stored timings.
+  Signal probes can mistake noise/music for speech or miss less extreme omissions;
+  never promise full semantic coverage. A later authorized focused real test
+  rejected a MAX_TOKENS loop, then recovered chunk 3 with one isolated retry;
+  see `REVISION_SEGMENTO_GEMINI.md`. It does not validate the whole meeting.
 - No test framework or build system is required. `tests/transcript-integrity.cjs` runs
   offline synthetic checks with Node and a local copy of the same Babel standalone
   7.23.0 used by `index.html`: `node tests/transcript-integrity.cjs <path-to-babel.cjs>`.
@@ -338,6 +374,43 @@ The repair also applies to human analysis/name text and stored minute/task text,
 never configuration, keys or existing task/identity IDs. Prompts request normal
 Unicode. Loading an old transcript repairs its displayed text without an API
 call; its existing speaker IDs are not merged or acoustically re-identified.
+
+### Text encoding follow-up (2026-10-14)
+
+`repairTextEncoding` extends the existing byte repair with a small whitelist of
+text entities and printable numeric Unicode scalars. It never parses or renders
+HTML; React text children remain the rendering path. Code spans/fences, unknown
+entities, malformed strings and invalid scalars stay intact. Original speech
+survives in `textEncodingRepair` (`escaped-utf8`, `html-entities`, `mixed-encoding`)
+or `transcript_encoding_original` for legacy raw data. IDs/times/source indices
+are unchanged. This is representation repair, not missing-word reconstruction.
+
+Controls/replacement characters, unconvertible codes and a bounded suspicious-ú
+heuristic produce a persistent partial warning. The heuristic needs >=300 text
+characters, >=8 ú, no other usual Spanish diacritics/signs and >=10 common Spanish
+function words; it can miss other corruption and can flag unusual legitimate
+text. It never replaces ú. Gemini checks this alongside sparse/repetition guards
+using the same single validation retry; encoding retries isolate the already
+uploaded main audio. If still suspect, preserve usable speech, warn and give
+initial/imported/regenerated analysis the partial flag. Partial chunks cannot
+supply new references or adjacent tail. Loading saved data makes no API call.
+
+The prompt uses affirmative natural-orthography wording with actual Spanish
+characters; the prior prompt already requested Unicode, not HTML. Four manual
+File API tests sent 180+180+120+120 seconds total, with the same model/SDK. All
+returned STOP and correct characters; original HTTP text equalled SDK text and
+the normalized/stored projection. They did NOT reproduce the user's intermittent
+full-chunk failure or establish that prompt wording caused/fixed it. No reference
+samples, preview, prior tail, speaker naming or analysis API calls were included.
+The server/config/database/backup/mobile view were not edited. See metrics-only
+`tests/gemini-text-encoding-validation.json` and `REVISION_CODIFICACION_GEMINI.md`.
+Do not repeat these calls automatically; their 600-second budget is exhausted.
+
+`tests/text-encoding.cjs` has 12 offline groups on actual compiled functions,
+including migration/import, text rendering and retry/failure handling; the existing
+24 small-correction groups also passed. Babel compilation is not static typing or
+a mounted-browser/end-to-end audio test. The live App was never mounted in these
+checks. Private raw responses/audio outputs remain outside the repository.
 
 ### Task Ownership
 `Task.is_owner` marks a task as belonging to the configured user; it drives the two columns in
