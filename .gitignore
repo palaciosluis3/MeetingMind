@@ -12,3 +12,17 @@ VISTA_MOVIL.html
 server_errors.log
 __pycache__/
 *.pyc
+
+# FFmpeg descargado automáticamente; el instalador Python sí se versiona.
+/.runtime/
+
+# Apoyo local: documentación e instrucciones, sin uso durante la ejecución.
+/AGENTS.md
+/IMPLEMENTACION_AUDIO_LARGO.md
+
+# Plantilla de configuración para distribución; el servidor usa sus propios
+# valores predeterminados si aún no existe config.json.
+/config.example.json
+
+# Verificaciones y herramientas de desarrollo, sin dependencias de ejecución.
+/tests/

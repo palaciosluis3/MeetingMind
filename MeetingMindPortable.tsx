@@ -2113,45 +2113,8 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
     });
 };
 
-// Encode one sample range of a decoded buffer as a 16-bit mono PCM WAV, averaging
-// the channels on the fly. Doing the downmix here rather than up front avoids
-// materializing a second full-length copy of the recording, which matters a lot
-// for a 90-minute meeting.
-const encodeWAVRange = (channels: Float32Array[], from: number, to: number, sampleRate: number): Blob => {
-    const count = Math.max(0, to - from);
-    const bytes = count * 2;
-    const buffer = new ArrayBuffer(44 + bytes);
-    const view = new DataView(buffer);
-    const writeStr = (off: number, s: string) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
-    writeStr(0, 'RIFF');
-    view.setUint32(4, 36 + bytes, true);
-    writeStr(8, 'WAVE');
-    writeStr(12, 'fmt ');
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true);          // PCM
-    view.setUint16(22, 1, true);          // mono
-    view.setUint32(24, sampleRate, true);
-    view.setUint32(28, sampleRate * 2, true);
-    view.setUint16(32, 2, true);
-    view.setUint16(34, 16, true);
-    writeStr(36, 'data');
-    view.setUint32(40, bytes, true);
-
-    const nch = channels.length;
-    let off = 44;
-    for (let i = from; i < to; i++) {
-        let sum = 0;
-        for (let c = 0; c < nch; c++) sum += channels[c][i];
-        const s = Math.max(-1, Math.min(1, sum / nch));
-        view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-        off += 2;
-    }
-    return new Blob([view], { type: 'audio/wav' });
-};
-
-// Decode any browser-supported audio/video, downmix to mono + resample to 16 kHz,
-// and split into fixed-length WAV segments. Throws if the browser can't decode
-// the container/codec; callers must stop before uploading an unsegmented file.
+// Only the currently used chunk has a browser Blob. The original recording is
+// streamed to the local Python server; FFmpeg never runs in browser memory.
 interface AudioChunk {
     blob: Blob;
     audioStartSec: number;    // where this blob's audio begins in the full recording
@@ -2160,66 +2123,104 @@ interface AudioChunk {
     mimeType: string;
 }
 
-const decodeAndChunk = async (
-    blob: Blob,
-    chunkSeconds: number
-): Promise<{ chunks: AudioChunk[], duration: number }> => {
-    const AC = (window as any).AudioContext || (window as any).webkitAudioContext;
+interface PreparedAudioChunk extends Omit<AudioChunk, 'blob'> { id: string; samples: number; }
+interface PreparedAudio {
+    chunks: PreparedAudioChunk[];
+    loadChunk: (chunk: PreparedAudioChunk) => Promise<AudioChunk>;
+    release: () => Promise<void>;
+}
 
-    // Decode STRAIGHT to the target rate. decodeAudioData resamples to the
-    // context's sampleRate, so asking for 16 kHz up front avoids materializing a
-    // full 48 kHz stereo buffer first — for a 90-minute meeting that alone was
-    // over 2 GB of PCM, which is what made decoding fail on long recordings.
-    let ctx: any;
+const localAudioJson = async (url: string, options?: RequestInit): Promise<any> => {
+    const response = await fetch(url, options);
+    let data: any;
+    try { data = await response.json(); }
+    catch { throw new Error('El servidor local no ofrece la preparación de audio. Vuelve a iniciar MeetingMind.'); }
+    if (!response.ok) throw new Error(data?.error || 'Falló una operación de audio en el servidor local.');
+    return data;
+};
+
+const validateAudioManifest = (manifest: any): PreparedAudioChunk[] => {
+    const fail = () => { throw new Error('La preparación local está incompleta o sus límites no son válidos. No se envió audio a la IA.'); };
+    if (!manifest || manifest.sampleRate !== TARGET_SAMPLE_RATE || manifest.channels !== 1 || manifest.sampleWidth !== 2 ||
+        manifest.chunkSeconds !== CHUNK_SECONDS || manifest.overlapSeconds !== CHUNK_OVERLAP_SECONDS ||
+        !Number.isFinite(manifest.durationSec) || manifest.durationSec <= 0 || manifest.durationSec > LIMIT_SECONDS ||
+        !Array.isArray(manifest.chunks)) return fail();
+    const totalSamples = Math.round(manifest.durationSec * TARGET_SAMPLE_RATE);
+    const chunkSamples = CHUNK_SECONDS * TARGET_SAMPLE_RATE;
+    if (!Number.isSafeInteger(totalSamples) || Math.abs(manifest.durationSec * TARGET_SAMPLE_RATE - totalSamples) > 0.000001 ||
+        manifest.chunks.length !== Math.ceil(totalSamples / chunkSamples)) return fail();
+    const ids = new Set<string>();
+    return manifest.chunks.map((chunk: any, index: number) => {
+        const start = index * chunkSamples;
+        const from = index ? start - CHUNK_OVERLAP_SECONDS * TARGET_SAMPLE_RATE : 0;
+        const samples = Math.min(start + chunkSamples, totalSamples) - from;
+        if (!chunk || typeof chunk.id !== 'string' || !/^[0-9a-f]{32}$/.test(chunk.id) || ids.has(chunk.id) ||
+            chunk.mimeType !== 'audio/wav' || chunk.samples !== samples || chunk.audioStartSec !== from / TARGET_SAMPLE_RATE ||
+            chunk.contentStartSec !== start / TARGET_SAMPLE_RATE || chunk.durationSec !== samples / TARGET_SAMPLE_RATE) return fail();
+        ids.add(chunk.id);
+        return { id: chunk.id, samples, audioStartSec: chunk.audioStartSec, contentStartSec: chunk.contentStartSec,
+            durationSec: chunk.durationSec, mimeType: chunk.mimeType };
+    });
+};
+
+const prepareLocalAudio = async (blob: Blob, onStatus: (message: string) => void): Promise<PreparedAudio> => {
+    onStatus('Preparando herramientas de audio en este equipo · la primera vez puede descargar FFmpeg…');
+    const job = await localAudioJson('/api/audio/jobs', { method: 'POST' });
+    if (typeof job.id !== 'string' || !/^[0-9a-f]{32}$/.test(job.id)) throw new Error('El servidor local devolvió un trabajo de audio inválido.');
+    const base = `/api/audio/jobs/${job.id}`;
+    let released = false;
+    const release = async () => {
+        if (released) return;
+        try {
+            await localAudioJson(`${base}/release`, { method: 'POST' });
+            released = true;
+        } catch { console.warn('[AUDIO LOCAL] No se pudo solicitar la limpieza; el servidor la reintentará por caducidad o al cerrarse.'); }
+    };
     try {
-        ctx = new AC({ sampleRate: TARGET_SAMPLE_RATE });
-    } catch {
-        ctx = new AC(); // older engines ignore/reject the option
-    }
-
-    let decoded: AudioBuffer;
-    try {
-        decoded = await ctx.decodeAudioData(await blob.arrayBuffer());
-    } finally {
-        try { ctx.close(); } catch { /* ignore */ }
-    }
-
-    const duration = decoded.duration;
-    let source: AudioBuffer = decoded;
-    if (decoded.sampleRate !== TARGET_SAMPLE_RATE) {
-        // The engine ignored the requested rate; fall back to resampling offline.
-        const offline = new OfflineAudioContext(1, Math.ceil(duration * TARGET_SAMPLE_RATE), TARGET_SAMPLE_RATE);
-        const src = offline.createBufferSource();
-        src.buffer = decoded;
-        src.connect(offline.destination);
-        src.start();
-        source = await offline.startRendering();
-    }
-
-    const channels: Float32Array[] = [];
-    for (let c = 0; c < source.numberOfChannels; c++) channels.push(source.getChannelData(c));
-    const totalSamples = source.length;
-
-    const samplesPerChunk = chunkSeconds * TARGET_SAMPLE_RATE;
-    // Overlap the cut so the model hears the run-up to its own first words.
-    // Without it, every segment opened mid-sentence and the speaker was guessed.
-    const overlapSamples = Math.min(CHUNK_OVERLAP_SECONDS * TARGET_SAMPLE_RATE, Math.floor(samplesPerChunk / 4));
-    const chunks: AudioChunk[] = [];
-
-    for (let start = 0; start < totalSamples; start += samplesPerChunk) {
-        const from = start === 0 ? 0 : start - overlapSamples;
-        const to = Math.min(start + samplesPerChunk, totalSamples);
-        chunks.push({
-            blob: encodeWAVRange(channels, from, to, TARGET_SAMPLE_RATE),
-            // Where this blob's audio actually begins — model timestamps are relative to it.
-            audioStartSec: from / TARGET_SAMPLE_RATE,
-            // Where this segment's *new* content begins; anything earlier is overlap.
-            contentStartSec: start / TARGET_SAMPLE_RATE,
-            durationSec: (to - from) / TARGET_SAMPLE_RATE,
-            mimeType: 'audio/wav',
+        onStatus('Transfiriendo al servidor local en este equipo…');
+        await new Promise<void>((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', `${base}/source`);
+            xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+            xhr.upload.onprogress = event => {
+                if (event.lengthComputable && event.total > 0) onStatus(`Transfiriendo al servidor local en este equipo · ${Math.floor(event.loaded / event.total * 100)}%`);
+            };
+            xhr.upload.onload = () => onStatus('Preparando audio con FFmpeg en este equipo…');
+            xhr.onerror = () => reject(new Error('Se perdió la conexión con el servidor local al transferir el audio.'));
+            xhr.onabort = () => reject(new Error('La transferencia al servidor local se interrumpió.'));
+            xhr.onload = () => {
+                if (xhr.status >= 200 && xhr.status < 300) resolve();
+                else {
+                    let message = 'No se pudo transferir el archivo al servidor local.';
+                    try { message = JSON.parse(xhr.responseText).error || message; } catch { /* non-JSON server error */ }
+                    reject(new Error(message));
+                }
+            };
+            xhr.send(blob); // File/Blob is streamed; never arrayBuffer() the recording.
         });
+        while (true) {
+            const status = await localAudioJson(base);
+            if (status.state === 'failed') throw new Error(status.error || 'Falló FFmpeg. Consulta server_errors.log.');
+            if (status.state === 'ready') {
+                const chunks = validateAudioManifest(status.manifest);
+                return { chunks, release, loadChunk: async chunk => {
+                    onStatus(`Cargando segmento local · ${Math.round(chunk.contentStartSec / 60)} min de inicio…`);
+                    const response = await fetch(`${base}/chunks/${chunk.id}`);
+                    if (!response.ok) throw new Error('El segmento preparado ya no está disponible en el servidor local.');
+                    const wav = await response.blob();
+                    if (wav.size !== 44 + chunk.samples * 2) throw new Error('La transferencia del segmento local quedó incompleta.');
+                    return { ...chunk, blob: wav };
+                } };
+            }
+            if (!['uploading', 'preparing'].includes(status.state)) throw new Error('El trabajo de preparación local no está disponible.');
+            const count = Number.isInteger(status.preparedChunks) ? status.preparedChunks : 0;
+            onStatus(`Preparando audio con FFmpeg en este equipo · ${count} segmento${count === 1 ? '' : 's'} preparado${count === 1 ? '' : 's'}; validando el archivo completo…`);
+            await new Promise(resolve => setTimeout(resolve, 500));
+        }
+    } catch (error) {
+        await release();
+        throw error;
     }
-    return { chunks, duration };
 };
 
 const textTokens = (text: string): { value: string, end: number }[] =>
@@ -2401,32 +2402,6 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
         handleAudioData(file, file.type, chosen, chosenMode);
     };
 
-    // Split the recording into segments by DURATION — identically for every
-    // provider. 10-minute chunks keep Gemini under its output token limit and,
-    // at ~19 MB each, also stay under OpenAI's 25 MB upload cap, so there is no
-    // reason to branch on provider or on file size here.
-    const prepareSegments = async (blob: Blob): Promise<AudioChunk[] | null> => {
-        onProcessingStart("Decodificando y segmentando el audio…");
-        try {
-            const { chunks, duration } = await decodeAndChunk(blob, CHUNK_SECONDS);
-            console.log(`Audio duration: ${Math.round(duration)}s -> ${chunks.length} segment(s)`);
-            if (duration > LIMIT_SECONDS) {
-                alert(`El audio dura ${Math.round(duration / 60)} minutos y el límite es de ${Math.round(LIMIT_SECONDS / 60)}. Recorta el archivo antes de procesarlo.`);
-                return null;
-            }
-            return chunks;
-        } catch (decodeErr) {
-            // Never upload the original file as a single fallback. A decoding
-            // failure means we cannot enforce the 10-minute safety boundary.
-            console.error("No se pudo decodificar y segmentar el archivo; se detiene antes de subirlo:", decodeErr);
-            throw new Error(
-                "El navegador no pudo decodificar este archivo para dividirlo en segmentos de 10 minutos. " +
-                "Por seguridad, el proceso se detuvo y el archivo no se envió a Gemini ni a OpenAI. " +
-                "Convierte el archivo a MP3 o WAV e inténtalo nuevamente."
-            );
-        }
-    };
-
     const handleAudioData = async (blob: Blob, mimeType: string, chosen: string, chosenMode: string = MODE_MEETING) => {
         // In-memory checkpoint: successful chunks remain available even if a
         // later transcription or analysis call fails. It deliberately does not
@@ -2438,6 +2413,7 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
         let segmentsSucceeded = 0;
         let segmentsFailed = 0;
         let segmentsPartial = 0;
+        let preparedAudio: PreparedAudio | undefined;
         onProvisionalTranscript?.([], []);
 
         try {
@@ -2445,10 +2421,10 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
             const ai = new GenAI({ apiKey });
             const displayName = (PROVIDERS[chosen] || PROVIDERS[PROVIDER_GEMINI]).label;
 
-            // 1. Decide how (and whether) to split.
+            // 1. Local transfer + full native validation before any provider upload.
             clock.start('preparation');
-            const segments = await prepareSegments(blob);
-            if (!segments) { onProcessingComplete(null); return; }
+            preparedAudio = await prepareLocalAudio(blob, onProcessingStart);
+            const segments = preparedAudio.chunks;
             clock.setSegments(segments.length, 0, 0);
 
             // Upload one segment to Gemini (File API, with small base64 fallback).
@@ -2472,10 +2448,10 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
             let previousTurns: TurnSegment[] = [];
 
             for (let i = 0; i < segments.length; i++) {
-                const seg = segments[i];
+                const descriptor = segments[i];
                 const context: TranscriptChunkContext = {
-                    provider: chosen, chunkIndex: i, audioStartSec: seg.audioStartSec,
-                    contentStartSec: seg.contentStartSec, durationSec: seg.durationSec,
+                    provider: chosen, chunkIndex: i, audioStartSec: descriptor.audioStartSec,
+                    contentStartSec: descriptor.contentStartSec, durationSec: descriptor.durationSec,
                 };
                 const label = segments.length > 1 ? `Segmento ${i + 1}/${segments.length}` : 'Audio';
                 clock.start('preparation');
@@ -2484,6 +2460,9 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
                 let openAIUploadCompleted = false;
                 let openAIRequestCompleted = false;
                 try {
+                    // Not retained in `segments`: release this blob after its
+                    // transcription, signal checks and bounded voice clips settle.
+                    const seg = await preparedAudio.loadChunk(descriptor);
                     let turns: TurnSegment[];
 
                     if (isOpenAI(chosen)) {
@@ -2614,6 +2593,8 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
                 if (i < segments.length - 1) await new Promise(r => setTimeout(r, 1200));
             }
 
+            await preparedAudio.release();
+
             if (!allTurns.length) {
                 throw new Error("No se obtuvo transcripción del audio.");
             }
@@ -2681,6 +2662,8 @@ const InputPanel: React.FC<InputPanelProps> = ({ onProcessingStart, onProcessing
             }
             onProcessingComplete(null);
             onError("No se pudo procesar el audio: " + (err as Error).message);
+        } finally {
+            await preparedAudio?.release();
         }
     };
 

@@ -20,6 +20,7 @@ base de datos ni APIs de IA.
 |---|---|
 | **Sistema** | Windows 10 u 11 |
 | **Python** | Python 3 (probado con 3.13). Al instalarlo, marca la casilla **"Add Python to PATH"**. No requiere instalar ninguna librería. |
+| **FFmpeg** | La app lo descarga y verifica automáticamente cuando preparas el primer audio. Solo esa primera preparación necesita acceso a `files.pythonhosted.org`; después reutiliza su copia local. No requiere pip ni instalación manual. |
 | **Navegador** | Microsoft Edge (viene con Windows). Si no está, se abre el navegador por defecto. |
 | **API Key** | Una de Google Gemini, gratuita. Ver abajo. |
 
@@ -64,8 +65,10 @@ una clave que el proveedor ya no te va a volver a mostrar.
 1. **Cargar Audio** — acepta audio o video (`.mp3`, `.m4a`, `.wav`, `.mp4`…).
    Antes de subir nada, la app te muestra cuánto va a tardar y cuánto va a costar
    con cada modelo, calculado sobre la duración real de tu archivo.
-2. Elige el modelo y confirma. Las grabaciones largas se parten en segmentos de
-   10 minutos; el límite total es de 3 horas.
+2. Elige el modelo y el tipo de sesión. El archivo se transfiere al servidor
+   **local de tu propio equipo**, donde FFmpeg lo prepara en segmentos de 10
+   minutos. El límite total es de 3 horas y se comprueba antes de enviar audio
+   al proveedor de IA. Después comienza la transcripción con el modelo elegido.
 3. Al terminar quedan tres pestañas:
    - **Tareas** — tus tareas y las del equipo, en columnas separadas. Puedes
      marcarlas como completadas, añadir tareas a mano, importarlas y exportarlas
@@ -133,6 +136,66 @@ acta y las tareas siempre las genera Gemini, sin importar quién transcriba.
 Una reunión de una hora cuesta unos 36 centavos de dólar con el modelo de pago
 más caro, 27 con el más barato, y nada con Gemini.
 
+### Preparación local y audios largos
+
+El navegador conserva el archivo comprimido y carga un solo WAV preparado a la
+vez; ya no necesita decodificar toda la grabación con Web Audio. FFmpeg procesa
+el audio progresivamente como PCM16 mono a 16 kHz. Cada segmento contiene hasta
+600 segundos nuevos, con 8 segundos anteriores de solapamiento desde el segundo
+(hasta 608 segundos por WAV). El último conserva solo las muestras restantes.
+Estéreo no significa que cada canal corresponda a una persona.
+
+Verás **transferencia al servidor local**, **preparación con FFmpeg** y después
+la subida/transcripción con el proveedor. Solo la transferencia medible muestra
+porcentaje; durante la preparación se informa cuántos segmentos se han creado,
+sin tratarlos como completos hasta validar el archivo entero. Ese tiempo local
+se registra en Preparación; las estimaciones de los modelos siguen sin incluirlo.
+
+FFmpeg se busca en este orden:
+
+1. Ruta o comando indicado por la variable de entorno `MEETINGMIND_FFMPEG`.
+2. `tools/ffmpeg.exe` junto a la app, o `ffmpeg.exe` en la carpeta de la app.
+3. El comando `ffmpeg` en `PATH`.
+4. Su caché verificada en `.runtime/`. Si no existe o está dañada, descarga un
+   artefacto fijo de `imageio-ffmpeg 0.6.0` desde PyPI, comprueba su tamaño y SHA-256,
+   extrae únicamente FFmpeg y sus avisos, y comprueba que pueda ejecutarse.
+
+Una copia descargada de GitHub no necesita que el usuario instale FFmpeg ni
+paquetes Python: `ffmpeg_runtime.py` hace esta preparación con la biblioteca
+estándar, solo al procesar el primer audio, y reutiliza el ejecutable después.
+La interfaz muestra actividad durante esa primera descarga. Los binarios y la
+caché están excluidos de Git; el instalador Python sí debe incluirse en el repo.
+No hay dependencia de `../.audio-tools/` ni rutas de este computador.
+
+Hay artefactos para Windows x86/x64, Linux glibc x64/ARM64 y macOS Intel/ARM64.
+Windows ARM64 usa la emulación x64 del sistema; el ejecutable se valida antes de
+usarlo. La descarga y ejecución real se comprobaron en Windows x64; los demás
+sistemas solo tienen comprobaciones de selección de artefacto, no pruebas en esos
+equipos. El lanzador VBS sigue siendo de Windows; en otros sistemas se inicia
+`python server.pyw` y se abre `http://127.0.0.1:3000` en el navegador.
+
+La primera preparación necesita internet, espacio libre y permiso de escritura
+en la carpeta de la app. Si la red bloquea PyPI, el proceso informa el error y
+permite reintentar; también siguen disponibles FFmpeg en PATH y la ruta opcional
+`MEETINGMIND_FFMPEG`. No se envía audio a PyPI ni se inicia la transcripción si
+falla la preparación de la herramienta. Tras actualizar la app, cierra la ventana
+y vuelve a iniciar `LaunchMeetingMind.vbs` para cargar el servidor nuevo.
+
+Los trabajos guardan el original y sus WAV en carpetas aisladas del directorio
+temporal del sistema (`meetingmind-audio-*`). El original temporal se elimina
+al terminar de preparar; los WAV, al terminar de usarlos, fallar la preparación
+o cerrar normalmente el servidor. Los trabajos abandonados caducan después de
+seis horas sin actividad. Se necesita espacio temporal para la copia del archivo
+y los WAV (aproximadamente 346 MB de PCM para tres horas, más solapamientos).
+Un cierre forzado del proceso puede dejar temporales; no hay recuperación tras
+recarga ni cancelación de solicitudes a proveedores.
+
+Si no se puede obtener FFmpeg, falla la decodificación o la duración real supera 180 minutos,
+el proceso se detiene antes de enviar audio a la IA. No se recorta al límite ni
+se utiliza el archivo original como respaldo. `server_errors.log` conserva el
+diagnóstico técnico local. El servidor sigue atendiendo peticiones mientras
+transfiere y prepara audio.
+
 ### Vista en el celular
 
 Cada vez que se guardan cambios, la app regenera `VISTA_MOVIL.html`: un archivo
@@ -198,6 +261,9 @@ standalone. Se edita el archivo y se recarga.
 index.html                 Carga /config.js, Tailwind (CDN) y la app
 MeetingMindPortable.tsx    Toda la interfaz y la integración con las IA
 server.pyw                 Backend http.server: /api/db, /api/config, /config.js
+audio_preparation.py       FFmpeg progresivo, trabajos temporales y manifiestos
+ffmpeg_runtime.py          Descarga verificada y caché del ejecutable FFmpeg
+.runtime/                 Caché local generada, excluida de Git
 LaunchMeetingMind.vbs      Lanzador silencioso (arranca el backend y abre Edge)
 config.example.json        Plantilla de config.json
 AGENTS.md                  Notas de arquitectura y decisiones de diseño
@@ -207,3 +273,10 @@ AGENTS.md                  Notas de arquitectura y decisiones de diseño
 transcripción se normaliza en un solo punto, por qué los segmentos duran 10
 minutos, cómo se mantiene la continuidad de hablantes entre segmentos y qué
 cosas no hay que "arreglar".
+
+La preparación añade `POST /api/audio/jobs`, `POST /api/audio/jobs/<id>/source`,
+`GET /api/audio/jobs/<id>`, `GET /api/audio/jobs/<id>/chunks/<id>` y
+`POST /api/audio/jobs/<id>/release`. El cliente usa identificadores aleatorios;
+no puede elegir rutas del sistema. Estos endpoints solo admiten el origen local.
+El servidor usa hilos y serializa las escrituras de configuración/base de datos
+y la generación de la vista móvil para evitar carreras.

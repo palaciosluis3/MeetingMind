@@ -7,6 +7,13 @@ import os
 import sys
 import shutil
 import tempfile
+import threading
+import time
+import re
+from functools import wraps
+from urllib.parse import urlsplit
+
+from audio_preparation import AudioJobs, PreparationError, ID_PATTERN, IO_BYTES
 
 import mimetypes
 
@@ -23,6 +30,15 @@ PORT = 3000
 DB_FILE = "database.json"
 BACKUP_FILE = "database.json.bak"
 CONFIG_FILE = "config.json"
+PERSISTENCE_LOCK = threading.RLock()
+
+
+def serialized_storage(function):
+    @wraps(function)
+    def locked(*args, **kwargs):
+        with PERSISTENCE_LOCK:
+            return function(*args, **kwargs)
+    return locked
 
 # Per-user settings. This file is NEVER part of what gets distributed: it holds
 # the API keys and the name of the person the app belongs to. Each user writes
@@ -36,6 +52,7 @@ DEFAULT_CONFIG = {
 }
 
 
+@serialized_storage
 def write_json_atomic(path, data, backup_path=None):
     """Persist JSON without risking corruption on a crash or partial write.
 
@@ -61,6 +78,7 @@ def save_db_atomic(data):
     write_json_atomic(DB_FILE, data, BACKUP_FILE)
 
 
+@serialized_storage
 def load_config():
     """Read config.json, filling in defaults for anything missing or invalid."""
     config = dict(DEFAULT_CONFIG)
@@ -81,6 +99,7 @@ def load_config():
     return config
 
 
+@serialized_storage
 def save_config(patch):
     """Merge a partial config over the stored one and persist it.
 
@@ -96,6 +115,87 @@ def save_config(patch):
     return config
 
 class PortableBackendHandler(http.server.SimpleHTTPRequestHandler):
+    def audio_request_allowed(self):
+        # New disk-writing endpoints are only for the local app, not other sites.
+        expected_port = self.server.server_port
+        try:
+            host = urlsplit('http://' + self.headers.get('Host', ''))
+            origin = urlsplit(self.headers.get('Origin', ''))
+            allowed = (host.hostname in ('127.0.0.1', 'localhost') and
+                       host.port == expected_port and
+                       (not origin.geturl() or
+                        (origin.scheme == 'http' and origin.netloc == host.netloc)))
+        except ValueError:
+            allowed = False
+        if not allowed:
+            self.send_json(403, {'error': 'La preparación de audio solo admite la app local.'})
+        return allowed
+
+    def send_json(self, status, data):
+        encoded = json.dumps(data, ensure_ascii=False).encode('utf-8')
+        try:
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+        except ConnectionError:
+            pass  # The local client may close while a transfer is being released.
+
+    def handle_audio_request(self):
+        if not self.path.startswith('/api/audio/'):
+            return False
+        if not self.audio_request_allowed():
+            return True
+        jobs = self.server.audio_jobs
+        match = re.fullmatch(r'/api/audio/jobs/(' + ID_PATTERN + r')(?:/(source|release|chunks/(' + ID_PATTERN + r')))?', self.path)
+        try:
+            if self.command == 'POST' and self.path == '/api/audio/jobs':
+                self.send_json(201, jobs.create())
+            elif match:
+                job_id, action, chunk_id = match.groups()
+                if self.command == 'GET' and action is None:
+                    self.send_json(200, jobs.status(job_id))
+                elif self.command == 'POST' and action == 'source':
+                    if self.headers.get('Content-Type', '').split(';')[0] != 'application/octet-stream':
+                        self.send_json(415, {'error': 'Se esperaba el archivo de audio como cuerpo binario.'})
+                        return True
+                    try:
+                        size = int(self.headers.get('Content-Length', '0'))
+                    except ValueError:
+                        size = 0
+                    if size <= 0 or self.headers.get('Transfer-Encoding'):
+                        self.send_json(411, {'error': 'El archivo debe tener una longitud válida y no estar vacío.'})
+                        return True
+                    self.connection.settimeout(120)
+                    jobs.receive(job_id, self.rfile, size)
+                    self.send_json(202, jobs.status(job_id))
+                elif self.command == 'POST' and action == 'release':
+                    jobs.release(job_id)
+                    self.send_json(200, {'status': 'released'})
+                elif self.command == 'GET' and chunk_id:
+                    with jobs.chunk(job_id, chunk_id) as source:
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'audio/wav')
+                        self.send_header('Content-Length', str(os.fstat(source.fileno()).st_size))
+                        self.end_headers()
+                        shutil.copyfileobj(source, self.wfile, length=IO_BYTES)
+                else:
+                    self.send_json(404, {'error': 'Operación de audio no disponible.'})
+            else:
+                self.send_json(404, {'error': 'Trabajo de audio no disponible.'})
+        except KeyError:
+            self.send_json(404, {'error': 'El trabajo o segmento local ya no está disponible. Vuelve a seleccionar el audio.'})
+        except PreparationError as exc:
+            logging.error('Local audio request refused: %s', exc)
+            self.send_json(422, {'error': str(exc)})
+        except ConnectionError:
+            pass
+        except Exception:
+            logging.exception('Local audio request failed')
+            self.send_json(500, {'error': 'Falló una operación local de audio. Consulta server_errors.log.'})
+        return True
+
     def log_message(self, format, *args):
         """Never touch sys.stderr.
 
@@ -116,6 +216,8 @@ class PortableBackendHandler(http.server.SimpleHTTPRequestHandler):
         super().end_headers()
 
     def do_GET(self):
+        if self.handle_audio_request():
+            return
         if self.path == "/config.js":
             # Served as a plain script so index.html can load it synchronously,
             # before the app starts. That keeps the configuration available at
@@ -135,11 +237,13 @@ class PortableBackendHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Content-type', 'application/json')
             self.end_headers()
             
-            if os.path.exists(DB_FILE):
-                with open(DB_FILE, 'r', encoding='utf-8') as f:
-                    self.wfile.write(f.read().encode())
-            else:
-                self.wfile.write(json.dumps({}).encode())
+            with PERSISTENCE_LOCK:
+                if os.path.exists(DB_FILE):
+                    with open(DB_FILE, 'r', encoding='utf-8') as f:
+                        body = f.read().encode()
+                else:
+                    body = json.dumps({}).encode()
+            self.wfile.write(body)
             return
         return super().do_GET()
 
@@ -148,19 +252,19 @@ class PortableBackendHandler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
+        if self.handle_audio_request():
+            return
         if self.path == "/api/shutdown":
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps({"status": "shutting down"}).encode())
             
-            # Kill server in background thread to let response send
-            import threading
-            import time
-            def kill():
+            # Stop normally after sending the response, allowing job cleanup.
+            def stop():
                 time.sleep(1)
-                os._exit(0)
-            threading.Thread(target=kill).start()
+                self.server.shutdown()
+            threading.Thread(target=stop, daemon=True).start()
             return
 
         if self.path == "/api/config":
@@ -195,8 +299,9 @@ class PortableBackendHandler(http.server.SimpleHTTPRequestHandler):
                     self.send_error(400, "Expected a JSON object")
                     return
 
-                save_db_atomic(data)
-                generate_mobile_view(data)
+                with PERSISTENCE_LOCK:
+                    save_db_atomic(data)
+                    generate_mobile_view(data)
 
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
@@ -335,6 +440,21 @@ def generate_mobile_view(data):
         f.write(html_content)
 
 
+class PortableHTTPServer(http.server.ThreadingHTTPServer):
+    # Wait for existing local transfers to unwind on shutdown.
+    daemon_threads = False
+
+    def __init__(self, address, handler=PortableBackendHandler, *, app_dir=None):
+        super().__init__(address, handler)
+        self.audio_jobs = AudioJobs(app_dir or os.path.dirname(os.path.abspath(__file__)))
+
+    def server_close(self):
+        # TCPServer also calls this if binding fails, before jobs exist.
+        if hasattr(self, 'audio_jobs'):
+            self.audio_jobs.close()
+        super().server_close()
+
+
 if __name__ == "__main__":
     # Ensure current dir is where the script is
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
@@ -345,7 +465,7 @@ if __name__ == "__main__":
 
     try:
         server_address = ('127.0.0.1', PORT)
-        httpd = http.server.HTTPServer(server_address, PortableBackendHandler)
+        httpd = PortableHTTPServer(server_address)
     except OSError as e:
         # Port taken: another instance is already serving, so let it. Exit 3 so
         # the launcher can tell this apart from a real crash.
@@ -368,3 +488,5 @@ if __name__ == "__main__":
     except Exception as e:
         logging.error(f"Server crashed: {e}", exc_info=True)
         sys.exit(1)
+    finally:
+        httpd.server_close()
