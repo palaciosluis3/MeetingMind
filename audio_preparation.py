@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from pathlib import Path
 import logging
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -11,8 +12,6 @@ import threading
 import time
 import uuid
 import wave
-
-from ffmpeg_runtime import ensure_ffmpeg
 
 RATE = 16000
 CHUNK_SECONDS = 600
@@ -28,7 +27,7 @@ class PreparationError(Exception):
 
 
 def find_ffmpeg(app_dir):
-    """Prefer an explicit override, bundled binaries or PATH, then a managed download."""
+    """Use the distributed native executable; never download or install at runtime."""
     override = os.environ.get('MEETINGMIND_FFMPEG')
     if override:
         candidate = shutil.which(override) or override
@@ -36,16 +35,23 @@ def find_ffmpeg(app_dir):
             return str(Path(candidate).resolve())
         raise PreparationError('MEETINGMIND_FFMPEG no apunta a un ejecutable disponible.')
     app_dir = Path(app_dir)
-    for candidate in (app_dir / 'tools' / 'ffmpeg.exe', app_dir / 'ffmpeg.exe'):
+    if os.name == 'nt':
+        machine = platform.machine().lower()
+        bundled = app_dir / 'tools' / ('win32' if machine in ('x86', 'i386', 'i686') else '') / 'ffmpeg.exe'
+        candidates = (bundled, app_dir / 'ffmpeg.exe')
+    else:
+        candidates = (app_dir / 'tools' / 'ffmpeg', app_dir / 'ffmpeg')
+    for candidate in candidates:
         if candidate.is_file():
             return str(candidate.resolve())
     executable = shutil.which('ffmpeg')
     if executable:
         return executable
-    try:
-        return ensure_ffmpeg(app_dir)
-    except RuntimeError as exc:
-        raise PreparationError(str(exc)) from None
+    raise PreparationError(
+        'No se encontró el FFmpeg incluido con MeetingMind. Descarga y extrae '
+        'el repositorio completo, incluida la carpeta tools. No hace falta instalarlo '
+        'ni ejecutar la app como administrador. Si usas otro sistema, configura '
+        'un FFmpeg compatible en PATH o MEETINGMIND_FFMPEG. No se envió audio a la IA.')
 
 
 def prepare_audio(source, output, ffmpeg, *, progress=lambda *_: None,

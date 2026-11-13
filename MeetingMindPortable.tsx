@@ -2164,7 +2164,7 @@ const validateAudioManifest = (manifest: any): PreparedAudioChunk[] => {
 };
 
 const prepareLocalAudio = async (blob: Blob, onStatus: (message: string) => void): Promise<PreparedAudio> => {
-    onStatus('Preparando herramientas de audio en este equipo · la primera vez puede descargar FFmpeg…');
+    onStatus('Comprobando las herramientas de audio incluidas con MeetingMind…');
     const job = await localAudioJson('/api/audio/jobs', { method: 'POST' });
     if (typeof job.id !== 'string' || !/^[0-9a-f]{32}$/.test(job.id)) throw new Error('El servidor local devolvió un trabajo de audio inválido.');
     const base = `/api/audio/jobs/${job.id}`;

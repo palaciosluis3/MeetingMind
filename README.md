@@ -20,7 +20,7 @@ base de datos ni APIs de IA.
 |---|---|
 | **Sistema** | Windows 10 u 11 |
 | **Python** | Python 3 (probado con 3.13). Al instalarlo, marca la casilla **"Add Python to PATH"**. No requiere instalar ninguna librería. |
-| **FFmpeg** | La app lo descarga y verifica automáticamente cuando preparas el primer audio. Solo esa primera preparación necesita acceso a `files.pythonhosted.org`; después reutiliza su copia local. No requiere pip ni instalación manual. |
+| **FFmpeg** | Incluido en `tools/` para Windows de 32 y 64 bits. No requiere descarga adicional, pip, instalación manual ni permisos de administrador para instalar herramientas. |
 | **Navegador** | Microsoft Edge (viene con Windows). Si no está, se abre el navegador por defecto. |
 | **API Key** | Una de Google Gemini, gratuita. Ver abajo. |
 
@@ -154,32 +154,34 @@ se registra en Preparación; las estimaciones de los modelos siguen sin incluirl
 FFmpeg se busca en este orden:
 
 1. Ruta o comando indicado por la variable de entorno `MEETINGMIND_FFMPEG`.
-2. `tools/ffmpeg.exe` junto a la app, o `ffmpeg.exe` en la carpeta de la app.
+2. El ejecutable incluido en `tools/ffmpeg.exe` (Windows x64) o
+   `tools/win32/ffmpeg.exe` (Windows x86), según la arquitectura del sistema;
+   después, un `ffmpeg.exe` en la carpeta de la app.
 3. El comando `ffmpeg` en `PATH`.
-4. Su caché verificada en `.runtime/`. Si no existe o está dañada, descarga un
-   artefacto fijo de `imageio-ffmpeg 0.6.0` desde PyPI, comprueba su tamaño y SHA-256,
-   extrae únicamente FFmpeg y sus avisos, y comprueba que pueda ejecutarse.
 
-Una copia descargada de GitHub no necesita que el usuario instale FFmpeg ni
-paquetes Python: `ffmpeg_runtime.py` hace esta preparación con la biblioteca
-estándar, solo al procesar el primer audio, y reutiliza el ejecutable después.
-La interfaz muestra actividad durante esa primera descarga. Los binarios y la
-caché están excluidos de Git; el instalador Python sí debe incluirse en el repo.
-No hay dependencia de `../.audio-tools/` ni rutas de este computador.
+El repositorio y su ZIP deben incluir **la carpeta `tools/` completa**, con los
+ejecutables y sus avisos de terceros. Ya no se descarga, extrae ni instala
+FFmpeg al ejecutar la app, ni se necesita crear una caché de herramientas dentro
+de la carpeta de la aplicación. Se retiró el instalador `ffmpeg_runtime.py`.
+La caché `.runtime/` de la versión anterior ya no se utiliza. Tampoco se depende
+de `../.audio-tools/`, paquetes adicionales de Python ni rutas de este equipo.
 
-Hay artefactos para Windows x86/x64, Linux glibc x64/ARM64 y macOS Intel/ARM64.
-Windows ARM64 usa la emulación x64 del sistema; el ejecutable se valida antes de
-usarlo. La descarga y ejecución real se comprobaron en Windows x64; los demás
-sistemas solo tienen comprobaciones de selección de artefacto, no pruebas en esos
-equipos. El lanzador VBS sigue siendo de Windows; en otros sistemas se inicia
-`python server.pyw` y se abre `http://127.0.0.1:3000` en el navegador.
+La preparación local funciona sin conexión; transcribir y analizar siguen
+necesitando conexión con el proveedor elegido. La app todavía necesita escribir
+sus datos/configuración como en la versión original y disponer de espacio en
+el directorio temporal del sistema para preparar audio.
 
-La primera preparación necesita internet, espacio libre y permiso de escritura
-en la carpeta de la app. Si la red bloquea PyPI, el proceso informa el error y
-permite reintentar; también siguen disponibles FFmpeg en PATH y la ruta opcional
-`MEETINGMIND_FFMPEG`. No se envía audio a PyPI ni se inicia la transcripción si
-falla la preparación de la herramienta. Tras actualizar la app, cierra la ventana
-y vuelve a iniciar `LaunchMeetingMind.vbs` para cargar el servidor nuevo.
+Los dos ejecutables Windows incluidos se comprobaron en este equipo Windows x64.
+La selección de arquitectura x86/ARM64 se verificó con simulaciones; no se probó
+en equipos físicos de esas arquitecturas. ARM64 necesita emulación x64. En
+Linux/macOS hay que proporcionar un FFmpeg nativo en `tools/ffmpeg`, en PATH o
+mediante `MEETINGMIND_FFMPEG`, iniciar `python server.pyw` y abrir
+`http://127.0.0.1:3000`; los ejecutables incluidos son exclusivamente Windows.
+
+Versiones, hashes, licencias y procedencia: [tools/README.md](tools/README.md).
+Los binarios caben en Git normal y deben publicarse mediante Git; no son
+punteros de Git LFS. Tras actualizar, cierra la ventana y vuelve a iniciar
+`LaunchMeetingMind.vbs` para cargar el servidor nuevo.
 
 Los trabajos guardan el original y sus WAV en carpetas aisladas del directorio
 temporal del sistema (`meetingmind-audio-*`). El original temporal se elimina
@@ -262,8 +264,9 @@ index.html                 Carga /config.js, Tailwind (CDN) y la app
 MeetingMindPortable.tsx    Toda la interfaz y la integración con las IA
 server.pyw                 Backend http.server: /api/db, /api/config, /config.js
 audio_preparation.py       FFmpeg progresivo, trabajos temporales y manifiestos
-ffmpeg_runtime.py          Descarga verificada y caché del ejecutable FFmpeg
-.runtime/                 Caché local generada, excluida de Git
+tools/ffmpeg.exe           FFmpeg de Windows x64, incluido en el repositorio
+tools/win32/ffmpeg.exe     FFmpeg de Windows x86, incluido en el repositorio
+tools/                    Licencias, procedencia y configuración de los binarios
 LaunchMeetingMind.vbs      Lanzador silencioso (arranca el backend y abre Edge)
 config.example.json        Plantilla de config.json
 AGENTS.md                  Notas de arquitectura y decisiones de diseño

@@ -1,0 +1,3 @@
+# Ship actual binary content in repository ZIPs, without LFS or text conversion.
+/tools/ffmpeg.exe -text -filter -diff
+/tools/win32/ffmpeg.exe -text -filter -diff

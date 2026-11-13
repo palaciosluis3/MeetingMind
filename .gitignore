@@ -13,8 +13,11 @@ server_errors.log
 __pycache__/
 *.pyc
 
-# FFmpeg descargado automáticamente; el instalador Python sí se versiona.
+# Caché antigua de la descarga automática, ya retirada del flujo de uso.
 /.runtime/
+
+# Los binarios y avisos de tools/ forman parte de la distribución.
+# No ignorar *.exe ni tools/.
 
 # Apoyo local: documentación e instrucciones, sin uso durante la ejecución.
 /AGENTS.md
